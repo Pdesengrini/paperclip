@@ -17,6 +17,7 @@ const mockIssueService = vi.hoisted(() => ({
   getWakeableParentAfterChildCompletion: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   listReviewAttention: vi.fn(),
+  getDependencyReadiness: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -176,7 +177,15 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+const DEFAULT_LOCAL_BOARD_ACTOR = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+};
+
+async function createAppWithActor(actor: Record<string, unknown>) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -184,13 +193,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({
@@ -198,6 +201,10 @@ async function createApp() {
   } as any, {} as any));
   app.use(errorHandler);
   return app;
+}
+
+async function createApp() {
+  return createAppWithActor(DEFAULT_LOCAL_BOARD_ACTOR);
 }
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
@@ -236,6 +243,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -679,6 +687,80 @@ describe("issue update comment wakeups", () => {
           source: "comment.mention",
         }),
       }),
+    );
+  });
+
+  // COR-2416 loop-killer: a self / system comment (attributed to the local
+  // board but authored by the run that owns the issue) must not wake its own
+  // assignee, even on a blocked issue. Previously the agent-only self-detection
+  // missed the laundered "user" attribution and the assignee was re-woken.
+  it("does not wake the assignee for a self/system comment authored by the issue's own run", async () => {
+    const existing = makeIssue({
+      status: "blocked",
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      checkoutRunId: "run-checkout",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-system",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "heartbeat digest: still blocked on the same dependency",
+    });
+
+    const res = await request(
+      await createAppWithActor({
+        ...DEFAULT_LOCAL_BOARD_ACTOR,
+        runId: "run-checkout",
+      }),
+    )
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "heartbeat digest: still blocked on the same dependency" });
+
+    expect(res.status).toBe(200);
+    // Give the fire-and-forget wake dispatch time to run, then assert it never
+    // targeted the assignee.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.anything(),
+    );
+  });
+
+  // Invariant 1 (contrast with the self/system case above — same blocked issue
+  // and plain comment, differing only by the absence of a run id): a genuine
+  // human board comment still wakes the assignee.
+  it("still wakes the assignee for a genuine human comment (no run id) on a blocked issue", async () => {
+    const existing = makeIssue({
+      status: "blocked",
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      checkoutRunId: "run-checkout",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-human",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "any update here?",
+    });
+
+    const res = await request(
+      // Genuine human board actor: local_implicit, no run id.
+      await createAppWithActor({ ...DEFAULT_LOCAL_BOARD_ACTOR }),
+    )
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "any update here?" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
     );
   });
 });

@@ -157,6 +157,7 @@ import {
 } from "../services/task-watchdog-scope.js";
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
+import { isAssigneeSelfComment, shouldWakeAssigneeOnComment } from "./issue-self-comment.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
@@ -10666,14 +10667,29 @@ export function issueRoutes(
 
       if (commentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
-        const actorIsAgent = actor.actorType === "agent";
-        const selfComment = actorIsAgent && actor.actorId === assigneeId;
+        // Run/agent-aware self-detection: a comment authored by the assignee's
+        // own run counts as self even when attribution was laundered to a
+        // non-agent identity (see isAssigneeSelfComment).
+        const selfComment = isAssigneeSelfComment({
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          actorRunId: actor.runId,
+          assigneeAgentId: assigneeId,
+          checkoutRunId: issue.checkoutRunId,
+          executionRunId: issue.executionRunId,
+        });
         // Re-derive closed-ness from the post-update issue so a status change
         // like in_progress -> done with a closure comment does not enqueue a
         // stale issue_commented wake for an already-completed issue.
-        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
+        const closedComment = isClosedIssueStatus(issue.status);
+        const shouldWakeAssignee = shouldWakeAssigneeOnComment({
+          reopened: Boolean(reopened),
+          selfComment,
+          closedComment,
+          explicitMoveToTodoRequested,
+        });
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        if (assigneeId && !assigneeChanged && shouldWakeAssignee) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -12674,12 +12690,28 @@ export function issueRoutes(
       })) ?? currentIssue;
       const assigneeId = wakeIssueSnapshot.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
-      const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      // Run/agent-aware self-detection (see isAssigneeSelfComment): recognizes a
+      // laundered self-comment (non-agent attribution) authored by the run that
+      // owns this issue, which `actorType === "agent"` alone would miss.
+      const selfComment = isAssigneeSelfComment({
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        actorRunId: actor.runId,
+        assigneeAgentId: assigneeId,
+        checkoutRunId: wakeIssueSnapshot.checkoutRunId,
+        executionRunId: wakeIssueSnapshot.executionRunId,
+      });
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(wakeIssueSnapshot.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      const closedComment = isClosedIssueStatus(wakeIssueSnapshot.status);
+      const shouldWakeAssignee = shouldWakeAssigneeOnComment({
+        reopened: Boolean(reopened),
+        selfComment,
+        closedComment,
+        explicitMoveToTodoRequested,
+      });
+      if (assigneeId && shouldWakeAssignee) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",

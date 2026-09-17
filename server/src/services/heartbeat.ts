@@ -23057,9 +23057,20 @@ export function heartbeatService(
         // Suppress reopen only when every referenced comment came from this run;
         // mixed batches must still reopen because they contain a real follow-up.
         let deferredCommentWakeIsSelfAuthored = false;
+        // A deferred comment authored by the `local_trusted` fallback actor
+        // (`local-board`: authorType user, authorUserId `local-board`, no run
+        // binding) is the agent-credential-omitted launder from COR-2877/2890.
+        // It carries no genuine human interaction, so it must not reopen the
+        // completed issue — mirrors the route-level `local_implicit` guard in
+        // shouldImplicitlyMoveCommentedIssueToTodo.
+        let deferredCommentWakeIsLocalBoardLaunder = false;
         if (deferredCommentIds.length > 0) {
           const deferredComments = await tx
-            .select({ createdByRunId: issueComments.createdByRunId })
+            .select({
+              createdByRunId: issueComments.createdByRunId,
+              authorType: issueComments.authorType,
+              authorUserId: issueComments.authorUserId,
+            })
             .from(issueComments)
             .where(
               and(
@@ -23074,12 +23085,21 @@ export function heartbeatService(
             deferredComments.every(
               (comment) => comment.createdByRunId === run.id,
             );
+          deferredCommentWakeIsLocalBoardLaunder =
+            deferredComments.length > 0 &&
+            deferredComments.every(
+              (comment) =>
+                comment.authorType === "user" &&
+                comment.authorUserId === "local-board" &&
+                comment.createdByRunId === null,
+            );
         }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           !deferredCommentWakeIsSelfAuthored &&
+          !deferredCommentWakeIsLocalBoardLaunder &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (deferred.requestedByActorType === "user" ||
             deferredWakeReason === "issue_reopened_via_comment");

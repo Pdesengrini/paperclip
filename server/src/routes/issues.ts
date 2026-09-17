@@ -1922,6 +1922,7 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
   actorId: string;
+  actorSource?: "local_implicit" | "session" | "board_key" | "cloud_tenant";
   actorRunId: string | null | undefined;
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
@@ -1933,6 +1934,15 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // edits — flipping to todo here would contradict the caller's stated intent
   // in the same request.
   if (input.requestAddsExplicitBlockers) return false;
+  // `local_implicit` is the `local_trusted` default actor (`local-board`) used
+  // whenever a request carries no bearer and no resolvable run header. An agent
+  // tool call that omits its credential lands here (COR-2877/COR-2890) and would
+  // otherwise masquerade as a human comment that reopens the very issue the run
+  // just closed — the infinite wake loop. Such an ambiguous, unauthenticated
+  // fallback must never *implicitly* reopen finished agent work; a genuine
+  // reopen still travels the explicit `reopen: true` / `resume: true` path,
+  // which bypasses this predicate. (COR-2890.)
+  if (input.actorSource === "local_implicit") return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
   // even though the comment originates from the same heartbeat run that owns
   // the issue lock. Without this guard, an agent that closes its own issue and
@@ -13701,6 +13711,7 @@ export function issueRoutes(
           assigneeAgentId: issue.assigneeAgentId,
           actorType: actor.actorType,
           actorId: actor.actorId,
+          actorSource: actor.actorType === "user" ? actor.actorSource : undefined,
           actorRunId: actor.runId,
           checkoutRunId: issue.checkoutRunId,
           executionRunId: issue.executionRunId,

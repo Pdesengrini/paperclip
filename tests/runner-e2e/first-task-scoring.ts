@@ -1,3 +1,4 @@
+import { isBlockedUnstartedWake } from "./non-execution-wake.js";
 import { answerableRuntimeRunIds } from "./runtime-question-readiness.js";
 import { sanitizeJson } from "./redaction.js";
 import { createHash } from "node:crypto";
@@ -454,7 +455,7 @@ export function gradeFirstTask(e: FirstTaskEvidence): FirstTaskCheck[] {
     );
   add(
     "provider-runs-succeeded",
-    last.runs.length > 0 && last.runs.every((r) => r.status === "succeeded" ||
+    last.runs.length > 0 && last.runs.every((r) => r.status === "succeeded" || isBlockedUnstartedWake(r) ||
       (scenario.firstResponseOnly && r.status === "running" && answerableRuntimeRunIds(last.interactions).has(r.id))),
     "Provider runs succeeded, or a first-response run is paused on its recorded answerable native question",
     [last.id],

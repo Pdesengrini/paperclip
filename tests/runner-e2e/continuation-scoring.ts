@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { gradeQuestionDocumentation } from "./question-documentation-scoring.js";
 import type { ContinuationCase } from "./continuation-cases.js";
 export interface ContinuationCheckpoint {
@@ -55,7 +56,11 @@ export function gradeContinuation(input: {
       "Record the settled clarification/revision before sending explicit approval.",
     );
   }
-  const outputs = final?.documents.filter((d) => d.key !== "plan") ?? [];
+  const verifiedAttachments = (final?.attachments as Array<Record<string, any>> ?? []).filter(a =>
+    a.contentVerified === true && typeof a.body === "string" &&
+    createHash("sha256").update(a.body).digest("hex") === a.contentSha256);
+  const outputs = [...(final?.documents.filter((d) => d.key !== "plan") ?? []),
+    ...verifiedAttachments.map(a => ({ body: a.body as string, latestRevisionId: a.sha256 as string }))];
   const output = outputs.length === 1 ? outputs[0] : undefined;
   check(
     "updated-output",

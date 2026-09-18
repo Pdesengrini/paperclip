@@ -1,4 +1,6 @@
-import { answerableRuntimeRunIds } from "./runtime-question-readiness.js";
+import { prepareLegacyContinuationSkill } from "./continuation-fixtures.js";
+import { captureFirstTaskAttachments } from "./first-task-attachments.js";
+import { answerableRuntimeRunIds, isSingleClaudeQuestion } from "./runtime-question-readiness.js";
 import { expect, type Page } from "@playwright/test";
 import path from "node:path";
 import { continuationInitialReady } from "./continuation-readiness.js";
@@ -30,6 +32,7 @@ export async function runContinuationFlow(input: {
   fixtures: LiveFixtureValues;
   execution: MatrixExecution;
   nonce: string;
+  secrets: readonly string[];
   workspacePath: string;
   deadlineAt: number;
   restart(): Promise<void>;
@@ -116,7 +119,7 @@ export async function runContinuationFlow(input: {
         api.get<Row[]>(`/api/issues/${issue!.id}/documents`),
         api.get<Row[]>(`/api/issues/${issue!.id}/comments?order=asc`),
         api.get<Row[]>(`/api/issues/${issue!.id}/interactions`),
-        api.get<Row[]>(`/api/issues/${issue!.id}/attachments`),
+        captureFirstTaskAttachments(api, [{ id: issue!.id }], input.secrets),
       ]);
     const documents = await Promise.all(
       summaries.map((d) =>
@@ -159,9 +162,9 @@ export async function runContinuationFlow(input: {
     );
     expect(questions, "one real question must be shown").toHaveLength(1);
     const set = chatQuestionPresentation(questions[0].payload);
-    expect(set.questions, "ask only the requested next question").toHaveLength(
-      1,
-    );
+    if (scenario.id === "provider-question-bridge") {
+      expect(isSingleClaudeQuestion(set.questions), "one choice question with only the optional provider Other field").toBe(true);
+    } else expect(set.questions, "ask only the requested next question").toHaveLength(1);
     const before = new Set(runs.map((r) => r.id));
     if (choice) {
       expect(set.questions[0].answerMode, "choices must use radio controls").toBe("single_select");
@@ -198,6 +201,7 @@ export async function runContinuationFlow(input: {
     expect(c.issue.status, "waiting is not complete").not.toBe("done");
   }
   try {
+    if (execution.profile.generation === "legacy") await prepareLegacyContinuationSkill(api, fixtures.company.id, fixtures.agent.id);
     await api.patch("/api/instance/settings/experimental", {
       enableClassicTaskInterface: false,
     });

@@ -5,3 +5,10 @@ export function answerableRuntimeRunIds(interactions: ReadonlyArray<Record<strin
     typeof i.sourceRunId === "string" && typeof i.payload?.runtimeRequestId === "string")
     .map((i) => i.sourceRunId));
 }
+
+/** Claude's one question includes the ACP adapter's optional custom-answer
+ * companion field. It is not a second user question. */
+export function isSingleClaudeQuestion(questions: ReadonlyArray<Record<string, any>>) {
+  return questions.length >= 1 && questions.length <= 2 && questions[0]?.answerMode === "single_select" &&
+    questions.slice(1).every(q => q.answerMode === "text" && q.required === false && q.header === "Other" && /_custom-/.test(q.id));
+}

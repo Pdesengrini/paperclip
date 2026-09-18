@@ -1,3 +1,4 @@
+import { isBlockedUnstartedWake } from "./non-execution-wake.js";
 import { answerableRuntimeRunIds } from "./runtime-question-readiness.js";
 import { captureFirstTaskAttachments } from "./first-task-attachments.js";
 import { waitForFirstTaskReply } from "./first-task-replies.js";
@@ -272,7 +273,7 @@ export async function runFirstTaskFlow(input: {
       }),
       reject: ({ runs }) => {
         const bad = runs.find((r) =>
-          ["failed", "timed_out", "cancelled"].includes(r.status),
+          ["failed", "timed_out", "cancelled"].includes(r.status) && !isBlockedUnstartedWake(r),
         );
         if (bad)
           return `run status ${bad.status}: ${bad.errorCode ?? ""} ${bad.error ?? ""}`;

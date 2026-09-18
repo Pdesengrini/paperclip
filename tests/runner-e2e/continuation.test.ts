@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, symlink, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -203,4 +204,21 @@ it("requires a real provider question answered within the same run", () => {
     if (broken === "new-run") r.checkpoints.at(-1)!.runs.push({ id: "new", status: "succeeded", runtimeMode: "native" });
     expect(failures(r)).toContain("native-question-round-trip");
   }
+});
+
+it("grades verified task attachment bytes and rejects metadata-only, tampered, or duplicate output", () => {
+  const r = recording("answer-updates-scope");
+  const final = r.checkpoints.at(-1)!;
+  const body = final.documents[0].body;
+  const hash = createHash("sha256").update(body).digest("hex");
+  final.documents = [];
+  const attachment = { id: "file", contentVerified: true, body, sha256: hash, contentSha256: hash };
+  final.attachments = [attachment];
+  expect(failures(r)).toEqual([]);
+  final.attachments = [{ ...attachment, contentVerified: false }];
+  expect(failures(r)).toContain("updated-output");
+  final.attachments = [{ ...attachment, body: body + "tampered" }];
+  expect(failures(r)).toContain("updated-output");
+  final.attachments = [attachment, { ...attachment, id: "duplicate" }];
+  expect(failures(r)).toContain("updated-output");
 });

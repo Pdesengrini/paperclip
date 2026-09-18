@@ -1247,3 +1247,14 @@ it("allows first-response native question waits but never treats unfinished jour
   last.runs[0].status = "failed";
   expect(providerPassed()).toBe(false);
 });
+
+it("retains suppressed unstarted wakes without failing successful execution", () => {
+  const e = recording();
+  const last = e.checkpoints.at(-1)!;
+  const wake = { id: "blocked-wake", status: "cancelled", errorCode: "issue_dependencies_blocked", startedAt: null as string | null };
+  last.runs.push(wake);
+  const passed = () => gradeFirstTask(e).find(c => c.id === "provider-runs-succeeded")?.passed;
+  expect(passed()).toBe(true);
+  wake.startedAt = "2026-09-18";
+  expect(passed()).toBe(false);
+});

@@ -20,6 +20,7 @@ import {
   digestText,
   snapshotInstruction,
   gradeFirstTask,
+  gradeNativeSessionContinuity,
   firstTaskCompletionSettled,
   type FirstTaskEvidence,
   type FirstTaskCheckpoint,
@@ -1214,5 +1215,18 @@ describe("accept-while-running overlap evidence", () => {
     const check = gradeFirstTask(e).find(c => c.id === "accepted-while-running")!;
     expect(check.passed).toBe(overlap);
     expect(Boolean(check.notReached)).toBe(!overlap);
+  });
+});
+
+
+describe("native provider session continuity", () => {
+  const row = (id: string) => ({ id, nativeIssueId: "parent", nativeSessionId: "native", usageJson: { sessionReused: true }, runnerProfileJson: { sessionCheckpoint: { providerSessionId: "provider" }, nativeExecutionInput: { binding: { executionWorkspaceId: "workspace" } } } });
+  it("accepts stable parent identity, deduplicates checkpoints, and excludes children", () => {
+    expect(gradeNativeSessionContinuity([row("one"), row("one"), row("two"), { ...row("child"), nativeIssueId: "child", nativeSessionId: "different" }], "parent").passed).toBe(true);
+  });
+  it("rejects a fresh provider despite generic sessionReused metadata", () => {
+    const next = row("two"); next.runnerProfileJson.sessionCheckpoint.providerSessionId = "fresh";
+    expect(gradeNativeSessionContinuity([row("one"), next], "parent").passed).toBe(false);
+    expect(gradeNativeSessionContinuity([row("one")], "parent").passed).toBe(false);
   });
 });

@@ -160,10 +160,16 @@ export class CodexHarnessSession
       );
     }
     const dispositionOnlyRecovery = this.dispositionOnlyRecoveryAvailable;
+    // A native continuation already carries just new events and the current
+    // completion IDs. Do not wrap it in the prior task objective/constraints
+    // or re-invoke a skill whose instructions are already in this session.
+    let continuationTurn = false;
+    try { continuationTurn = record(JSON.parse(input.message.text)).schema === "paperclip.native-continuation.v1"; } catch { /* Ordinary text. */ }
+    const turnSkills = continuationTurn ? [] : this.skillInputs;
     const taskText =
       this.conversationMode === "direct"
         ? input.message.text
-        : dispositionOnlyRecovery
+        : dispositionOnlyRecovery || continuationTurn
           ? input.message.text
           : JSON.stringify({
               task: this.taskEnvelope,
@@ -192,7 +198,7 @@ export class CodexHarnessSession
     this.emit("turn.submitted", {
       envelopeSchema: this.taskEnvelope.schema,
       text: input.message.text,
-      ...(this.skillInputs.length ? { skillInputs: this.skillInputs } : {}),
+      ...(turnSkills.length ? { skillInputs: turnSkills } : {}),
       requestedCollaborationMode:
         input.requestedCollaborationMode ?? effectiveCollaborationMode,
       effectiveCollaborationMode,
@@ -219,11 +225,11 @@ export class CodexHarnessSession
         input: [
           userInput({
             role: "user",
-            text: this.skillInputs.length
-              ? `${this.skillInputs.map((skill) => `$${skill.name}`).join(" ")}\n\n${taskText}`
+            text: turnSkills.length
+              ? `${turnSkills.map((skill) => `$${skill.name}`).join(" ")}\n\n${taskText}`
               : taskText,
           }),
-          ...this.skillInputs,
+          ...turnSkills,
         ],
         ...(this.conversationMode === "direct"
           ? {}

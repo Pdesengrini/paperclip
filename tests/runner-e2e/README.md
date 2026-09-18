@@ -742,3 +742,18 @@ pnpm test:e2e:runner:browser-support
 # To use an installed Chrome instead of Playwright's Chromium:
 PAPERCLIP_PLAYWRIGHT_CHANNEL=chrome pnpm test:e2e:runner:browser-support
 ```
+
+### Native provider continuity
+
+The first-task `task-reply-accept` and `task-card-accept` journeys also verify that
+ordinary native follow-ups retain the parent task's workspace, native session,
+and provider session identities. A generic `sessionReused` flag is insufficient.
+The check excludes child runs and applies only to native profiles.
+
+For ordinary native comment and child-completion wakes, a verified provider resume
+receives only new attributed messages, the current authenticated interaction result,
+actual task edits, child results, and completion-report identifiers. The provider
+retains conversation history. Paperclip retains task state and authorization. A new
+or replacement session still receives the full bootstrap; specialized recovery,
+review, external-chat and planning paths retain their existing context. Legacy
+adapter prompts are unchanged.

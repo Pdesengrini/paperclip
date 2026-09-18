@@ -179,6 +179,23 @@ function isPlanningAttachment(a: Row): boolean {
 function verifiedFirstTaskOutputs(checkpoint: FirstTaskCheckpoint): Row[] {
   return [...checkpoint.documents, ...(checkpoint.attachments ?? []).filter(isVerifiedAttachment).map(attachmentDocument)];
 }
+/** Provider identities, not generic sessionReused flags, prove continuity. */
+export function gradeNativeSessionContinuity(runs: Row[], issueId: string): FirstTaskCheck {
+  const parent = [...new Map(runs.filter((run) => run.nativeIssueId === issueId).map((run) => [run.id, run])).values()];
+  const identities = parent.map((run) => ({
+    run: run.id,
+    session: run.nativeSessionId,
+    provider: run.runnerProfileJson?.sessionCheckpoint?.providerSessionId,
+    workspace: run.runnerProfileJson?.nativeExecutionInput?.binding?.executionWorkspaceId,
+  }));
+  const passed = parent.length >= 2 && ["session", "provider", "workspace"].every((key) =>
+    identities.every((identity) => typeof identity[key as "session"] === "string" && identity[key as "session"].length > 0) &&
+    new Set(identities.map((identity) => identity[key as "session"])).size === 1,
+  );
+  return { id: "native-session-continuity", passed, evidence: ["finished"],
+    detail: `Same-task follow-ups must retain native/provider/workspace identities: ${JSON.stringify(identities)}` };
+}
+
 export function gradeFirstTask(e: FirstTaskEvidence): FirstTaskCheck[] {
   const scenario = firstTaskScenario(e.caseId, e.nonce);
   const checks: FirstTaskCheck[] = [];
@@ -440,5 +457,9 @@ export function gradeFirstTask(e: FirstTaskEvidence): FirstTaskCheck[] {
     "All observed provider runs settled successfully",
     [last.id],
   );
+  if (e.runtimeSettings?.adapterType === "paperclip_runner" &&
+    ["task-reply-accept", "task-card-accept"].includes(e.caseId) && last.phase === "finished") {
+    checks.push({ ...gradeNativeSessionContinuity(e.checkpoints.flatMap((checkpoint) => checkpoint.runs), e.onboardingIssueId), evidence: [last.id] });
+  }
   return checks;
 }

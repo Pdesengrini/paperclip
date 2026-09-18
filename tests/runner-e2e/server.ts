@@ -351,7 +351,7 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 async function supervise() {
   const executionIds: string[] = JSON.parse(process.env.PAPERCLIP_RUNNER_E2E_EXECUTION_IDS ?? "[]");
   if (executionIds.some(id => id.includes(".legacy-claude.local."))) {
-    serverEnvironment.PATH = await qualifyLegacyClaudeCli(temporaryRoot, serverEnvironment);
+    definedServerEnvironment.PATH = await qualifyLegacyClaudeCli(temporaryRoot, definedServerEnvironment);
   }
   const databaseReservation = await prepareRunnerE2EServerConfig({
     temporaryRoot,

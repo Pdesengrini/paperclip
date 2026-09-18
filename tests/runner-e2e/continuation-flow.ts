@@ -3,7 +3,7 @@ import { captureFirstTaskAttachments } from "./first-task-attachments.js";
 import { answerableRuntimeRunIds, isSingleClaudeQuestion } from "./runtime-question-readiness.js";
 import { expect, type Page } from "@playwright/test";
 import path from "node:path";
-import { continuationInitialReady } from "./continuation-readiness.js";
+import { continuationAnswerCommitted, continuationInitialReady } from "./continuation-readiness.js";
 import { captureLoadedContinuation } from "./continuation-screenshot.js";
 import { seedContinuationContext } from "./continuation-workspace.js";
 import { pollUntil, type RunnerApi } from "./api.js";
@@ -63,7 +63,7 @@ export async function runContinuationFlow(input: {
     return { issue, runs };
   }
   let pausedRuntimeRunIds = new Set<string>();
-  async function settle(prior: Set<string>, requireQuestion = false) {
+  async function settle(prior: Set<string>, requireQuestion = false, answeredInteractionId?: string) {
     let stable = "";
     const previousPaused = pausedRuntimeRunIds;
     await pollUntil({
@@ -77,6 +77,7 @@ export async function runContinuationFlow(input: {
       accept: (state) => {
         const paused = answerableRuntimeRunIds(state.interactions);
         const idle =
+          continuationAnswerCommitted(state.interactions, answeredInteractionId) &&
           state.runs.some((r) => !prior.has(r.id) || previousPaused.has(r.id)) &&
           state.runs.every((r) => ["succeeded", "failed", "timed_out", "cancelled"].includes(r.status) ||
             (r.status === "running" && paused.has(r.id))) &&
@@ -184,7 +185,7 @@ export async function runContinuationFlow(input: {
       })
       .last()
       .click();
-    await settle(before);
+    await settle(before, false, questions[0].id);
   }
   async function reply(body: string) {
     const before = new Set(runs.map((r) => r.id));

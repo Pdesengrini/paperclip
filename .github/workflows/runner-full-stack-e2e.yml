@@ -928,7 +928,7 @@ jobs:
 
       - name: Install pinned legacy Claude CLI
         if: matrix.profileId == 'legacy-claude'
-        run: npm install --global --omit=dev @anthropic-ai/claude-code@2.1.19
+        run: npm install --global --omit=dev @anthropic-ai/claude-code@2.1.277
 
       - name: Qualify preinstalled Chrome
         if: needs.authorize.outputs.playwright_channel == 'chrome'

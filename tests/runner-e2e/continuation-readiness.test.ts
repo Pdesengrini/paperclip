@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { continuationInitialReady } from "./continuation-readiness.js";
+import { continuationAnswerCommitted, continuationInitialReady } from "./continuation-readiness.js";
 import { runnerMatrix } from "./catalog.js";
 
 describe("continuation readiness", () => {
@@ -14,4 +14,12 @@ describe("continuation readiness", () => {
       expect(execution.task.buildPrompt("revision-test")).not.toMatch(/contractRevision\s*:\s*["']1["']/);
     }
   });
+});
+
+it("waits for the clicked answer to commit instead of grading the original paused state", () => {
+  const card = { id: "submitted", status: "pending" };
+  expect(continuationAnswerCommitted([card], card.id)).toBe(false);
+  expect(continuationAnswerCommitted([{ ...card, id: "different", status: "answered" }], card.id)).toBe(false);
+  expect(continuationAnswerCommitted([{ ...card, status: "cancelled" }], card.id)).toBe(false);
+  expect(continuationAnswerCommitted([{ ...card, status: "answered" }], card.id)).toBe(true);
 });

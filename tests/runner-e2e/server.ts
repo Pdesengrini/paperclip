@@ -1,3 +1,4 @@
+import { qualifyLegacyClaudeCli } from "./legacy-claude-cli.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -348,6 +349,10 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 async function supervise() {
+  const executionIds: string[] = JSON.parse(process.env.PAPERCLIP_RUNNER_E2E_EXECUTION_IDS ?? "[]");
+  if (executionIds.some(id => id.includes(".legacy-claude.local."))) {
+    serverEnvironment.PATH = await qualifyLegacyClaudeCli(temporaryRoot, serverEnvironment);
+  }
   const databaseReservation = await prepareRunnerE2EServerConfig({
     temporaryRoot,
     configPath,

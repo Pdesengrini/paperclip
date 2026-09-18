@@ -760,3 +760,14 @@ review, external-chat and planning paths retain their existing context. Legacy
 adapter prompts are unchanged.
 
 The ACPX Claude-only `provider-question-bridge` case exercises the provider’s built-in question tool, verifies that its card appears in Paperclip, answers it in the browser, and requires the same paused run to finish with the selected fact. The `accept-while-running` fixture holds the committed card’s creation response until browser acceptance, making the overlap deterministic without changing production behavior.
+
+Local Legacy Claude cells qualify Claude Code `2.1.277` before starting the server.
+If the ambient CLI differs, the harness installs the exact version under the
+attempt's temporary root and prepends that private bin directory to the server's
+PATH. It does not change the developer's global installation. The old workflow
+pin, `2.1.19`, did not discover `.claude/skills` supplied through `--add-dir`;
+a provider-free CLI probe reproduced the missing skill on that version and
+confirmed discovery on `2.1.277`. The workflow pin and local qualifier are checked
+together. This change applies to local cells; Daytona images remain separately pinned.
+Continuation question flows also wait for the submitted interaction's durable
+`answered` state before considering the next checkpoint ready.

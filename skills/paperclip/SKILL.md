@@ -690,4 +690,23 @@ Again, rule #1 is: never ask a human to do what an agent could do. Try harder. T
 
 **Asking a free-text question.**
 
-For an open answer, use a text field, not invented choices. Copy the complete **Text answer** interaction example in [references/api-reference.md](references/api-reference.md#questions-and-waiting-for-human-input): it includes both the canonical `payload.questionSet` (`answerMode: "text"`) and required storage fields. The storage fallback alone renders the wrong control.
+For an open answer, use a text field, not invented choices. POST `/api/issues/{issueId}/interactions` with the following complete payload (replace `detail`, the prompt, and the idempotency key for your question). `questionSet` controls presentation; the matching `questions` entry is required storage compatibility and must not be sent alone.
+
+```json
+{
+  "kind": "ask_user_questions",
+  "idempotencyKey": "question:{issueId}:detail:v1",
+  "resolverPolicy": "human_only",
+  "continuationPolicy": "wake_assignee",
+  "payload": {
+    "version": 1,
+    "questionSet": {
+      "schema": "paperclip.question_set.v1",
+      "questions": [{ "id": "detail", "prompt": "What should I know?", "answerMode": "text", "required": true }]
+    },
+    "questions": [{ "id": "detail", "prompt": "What should I know?", "selectionMode": "single", "required": true, "options": [{ "id": "text", "label": "Your answer", "freeText": true }] }]
+  }
+}
+```
+
+See [the API reference](references/api-reference.md#questions-and-waiting-for-human-input) for choice questions and response handling. Include the normal Authorization and X-Paperclip-Run-Id headers.

@@ -687,3 +687,7 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
 
 Again, rule #1 is: never ask a human to do what an agent could do. Try harder. Try again. Ask another agent to help. Keep working until the goal is fully accomplished.
+
+**Asking a free-text question.**
+
+For an open answer, use a text field, not invented choices. Copy the complete **Text answer** interaction example in [references/api-reference.md](references/api-reference.md#questions-and-waiting-for-human-input): it includes both the canonical `payload.questionSet` (`answerMode: "text"`) and required storage fields. The storage fallback alone renders the wrong control.

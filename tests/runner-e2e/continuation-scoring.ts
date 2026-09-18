@@ -32,7 +32,7 @@ export function gradeContinuation(input: {
   const before = input.checkpoints.filter((c) => c.phase !== "final");
   check(
     "recorded-continuation",
-    before.length > 0 && !!final && final.runs.length >= 2,
+    before.length > 0 && !!final && final.runs.length >= (input.id === "provider-question-bridge" ? 1 : 2),
     "Initial and final turns must both be recorded.",
   );
   for (const c of before) {
@@ -104,6 +104,15 @@ export function gradeContinuation(input: {
       input.checkpoints.every((c) => c.children.length === 0),
       "No checkpoint may contain an unrequested child task.",
     );
+  if (input.id === "provider-question-bridge") {
+    const initial = before.find((c) => c.phase === "initial");
+    const pending = (initial?.interactions as Array<Record<string, any>> | undefined)?.find((i) =>
+      i.kind === "ask_user_questions" && i.status === "pending" && typeof i.payload?.runtimeRequestId === "string");
+    const answered = (final?.interactions as Array<Record<string, any>> | undefined)?.find((i) => i.id === pending?.id);
+    check("native-question-round-trip", Boolean(pending && answered?.status === "answered" &&
+      final?.runs.length === 1 && pending.sourceRunId === final.runs[0].id),
+      "A real provider-native card must be answered and resume the same run to completion.");
+  }
   if (input.id === "question-tool-documentation") checks.push(...gradeQuestionDocumentation(input.checkpoints, input.marker));
   return checks;
 }

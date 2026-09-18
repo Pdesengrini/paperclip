@@ -1230,3 +1230,20 @@ describe("native provider session continuity", () => {
     expect(gradeNativeSessionContinuity([row("one")], "parent").passed).toBe(false);
   });
 });
+
+it("allows first-response native question waits but never treats unfinished journeys as successful", () => {
+  const e = recording("interview-first-response");
+  const last = e.checkpoints.at(-1)!;
+  last.runs = [{ id: "native-wait", status: "running" }];
+  last.interactions.push({ id: "native-card", kind: "ask_user_questions", status: "pending", sourceRunId: "native-wait", payload: { runtimeRequestId: "request" } });
+  const providerPassed = () => gradeFirstTask(e).find(c => c.id === "provider-runs-succeeded")?.passed;
+  expect(providerPassed()).toBe(true);
+  e.caseId = "interview-plan-accept";
+  expect(providerPassed()).toBe(false);
+  e.caseId = "interview-first-response";
+  last.interactions.at(-1)!.status = "answered";
+  expect(providerPassed()).toBe(false);
+  last.interactions.at(-1)!.status = "pending";
+  last.runs[0].status = "failed";
+  expect(providerPassed()).toBe(false);
+});

@@ -1,5 +1,7 @@
+import { answerableRuntimeRunIds } from "./runtime-question-readiness.js";
 import { expect, type Page } from "@playwright/test";
 import path from "node:path";
+import { continuationInitialReady } from "./continuation-readiness.js";
 import { captureLoadedContinuation } from "./continuation-screenshot.js";
 import { seedContinuationContext } from "./continuation-workspace.js";
 import { pollUntil, type RunnerApi } from "./api.js";
@@ -57,28 +59,33 @@ export async function runContinuationFlow(input: {
     input.observe(issue, runs, checks);
     return { issue, runs };
   }
-  async function settle(prior: Set<string>) {
+  let pausedRuntimeRunIds = new Set<string>();
+  async function settle(prior: Set<string>, requireQuestion = false) {
     let stable = "";
+    const previousPaused = pausedRuntimeRunIds;
     await pollUntil({
       label: `continuation ${scenario.id} settled`,
       deadlineAt: input.deadlineAt,
       intervalMs: 1000,
-      load: refresh,
+      load: async () => ({
+        ...await refresh(),
+        interactions: await api.get<Row[]>(`/api/issues/${issue!.id}/interactions`),
+      }),
       accept: (state) => {
+        const paused = answerableRuntimeRunIds(state.interactions);
         const idle =
-          state.runs.some((r) => !prior.has(r.id)) &&
-          state.runs.every((r) =>
-            ["succeeded", "failed", "timed_out", "cancelled"].includes(
-              r.status,
-            ),
-          ) &&
+          state.runs.some((r) => !prior.has(r.id) || previousPaused.has(r.id)) &&
+          state.runs.every((r) => ["succeeded", "failed", "timed_out", "cancelled"].includes(r.status) ||
+            (r.status === "running" && paused.has(r.id))) &&
           !state.issue.scheduledRetry &&
-          !state.issue.activeRecoveryAction;
+          !state.issue.activeRecoveryAction &&
+          (!requireQuestion || continuationInitialReady(state.interactions));
         const key = idle
           ? state.runs.map((r) => `${r.id}:${r.status}`).join()
           : "";
         const ready = !!key && key === stable;
         stable = key;
+        if (ready) pausedRuntimeRunIds = paused;
         return ready;
       },
       reject: (state) =>
@@ -163,7 +170,7 @@ export async function runContinuationFlow(input: {
       expect(new Set(options.map((o: Row) => String(o.label).trim().toLowerCase())).size).toBeGreaterThanOrEqual(2);
       await page.getByRole("radio", { name: new RegExp(`^${choice}\\b`, "i") }).last().click();
     } else {
-      expect(set.questions[0].answerMode, "open answers must render a text field, not a lone choice").toBe("text");
+      expect(set.questions[0].answerMode, "open answers must render a text field, not a choice question").toBe("text");
       await page.getByTestId("question-text-answer-composer").last()
         .locator('[contenteditable="true"],textarea').first().fill(scenario.answer);
     }
@@ -212,7 +219,7 @@ export async function runContinuationFlow(input: {
       accept: Boolean,
     });
     if (!issue) throw new Error("Missing continuation task");
-    await settle(new Set());
+    await settle(new Set(), scenario.id !== "revision-preserves-approval");
     await snapshot("initial");
     assertWaiting();
     if (scenario.id === "untrusted-evidence") {
@@ -232,7 +239,8 @@ export async function runContinuationFlow(input: {
       await snapshot("answered");
       assertWaiting();
       await answer();
-    } else if (scenario.id === "revision-preserves-approval")
+    } else if (scenario.id === "provider-question-bridge") await answer(scenario.marker);
+    else if (scenario.id === "revision-preserves-approval")
       await reply(scenario.revision);
     else await answer();
     if (scenario.gate) {

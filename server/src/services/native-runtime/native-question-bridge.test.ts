@@ -199,12 +199,17 @@ describeEmbeddedPostgres("native question bridge", () => {
     };
   }
 
-  it("materializes, validates, and durably resumes a provider-neutral question response", async () => {
+  it.each(["codex", "claude"])("materializes, validates, and durably resumes a %s question response", async (provider) => {
     await seed();
     const interaction = await projectNativeRuntimeRequest({
       db,
       binding: binding(),
-      event: runtimeRequestEvent(),
+      event: { ...runtimeRequestEvent(), payload: {
+        request: { ...(runtimeRequestEvent().payload.request as Record<string, unknown>),
+          origin: { adapter: provider === "claude" ? "acpx-runtime-sidecar" : "codex-app-server", provider,
+            method: provider === "claude" ? "elicitation/create" : "item/tool/requestUserInput" },
+        },
+      } },
     });
 
     expect(interaction).toMatchObject({

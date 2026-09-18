@@ -22,7 +22,7 @@ const configPath = required("PAPERCLIP_CONFIG");
 const port = required("PAPERCLIP_RUNNER_E2E_PORT");
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const tsxCli = path.join(repositoryRoot, "cli/node_modules/tsx/dist/cli.mjs");
-const paperclipCli = path.join(repositoryRoot, "cli/src/index.ts");
+const paperclipCli = path.join(repositoryRoot, "tests/runner-e2e/server-entry.ts");
 const {
   controlDirectory,
   restartRequestPath,

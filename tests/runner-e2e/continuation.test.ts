@@ -67,7 +67,7 @@ const failures = (r: ReturnType<typeof recording>) =>
 describe("continuation behavioral evaluation", () => {
   it("registers all five cases for both runtime generations and providers", () => {
     const matrix = runnerMatrix.filter((c) => c.suite.id === "continuation");
-    expect(matrix).toHaveLength(22);
+    expect(matrix).toHaveLength(23);
     expect(new Set(matrix.map((c) => c.profile.id))).toEqual(
       new Set([
         "legacy-codex",
@@ -78,7 +78,7 @@ describe("continuation behavioral evaluation", () => {
     );
     expect(matrix.every((c) => !c.suite.manualOnly)).toBe(true);
   });
-  it.each(CONTINUATION_CASES.filter(id => id !== "question-tool-documentation"))("accepts a complete %s recording", (id) =>
+  it.each(CONTINUATION_CASES.filter(id => !["question-tool-documentation", "provider-question-bridge"].includes(id)))("accepts a complete %s recording", (id) =>
     expect(failures(recording(id))).toEqual([]),
   );
   it("fails premature output even when the final result is correct", () => {
@@ -180,5 +180,27 @@ it("seeds the recorded agent home rather than the harness workspace", async () =
     await expect(seedContinuationContext({ isolatedRoot: root, recordedCwd: path.join(root, "outside"), body: "data" })).rejects.toThrow("escaped");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+function providerQuestionRecording() {
+  const r = recording("provider-question-bridge");
+  const card = { id: "native-card", kind: "ask_user_questions", status: "pending", sourceRunId: "first", payload: { runtimeRequestId: "provider-request" } };
+  r.checkpoints[0].runs[0].status = "running";
+  r.checkpoints[0].interactions = [card];
+  r.checkpoints.at(-1)!.runs = [{ id: "first", status: "succeeded", runtimeMode: "native" }];
+  r.checkpoints.at(-1)!.interactions = [{ ...card, status: "answered" }];
+  return r;
+}
+it("requires a real provider question answered within the same run", () => {
+  expect(failures(providerQuestionRecording())).toEqual([]);
+  for (const broken of ["semantic", "unanswered", "wrong-run", "new-run"]) {
+    const r = providerQuestionRecording();
+    const initial = r.checkpoints[0].interactions[0] as any;
+    if (broken === "semantic") delete initial.payload.runtimeRequestId;
+    if (broken === "unanswered") (r.checkpoints.at(-1)!.interactions[0] as any).status = "pending";
+    if (broken === "wrong-run") initial.sourceRunId = "unrelated";
+    if (broken === "new-run") r.checkpoints.at(-1)!.runs.push({ id: "new", status: "succeeded", runtimeMode: "native" });
+    expect(failures(r)).toContain("native-question-round-trip");
   }
 });

@@ -14,15 +14,61 @@
  * the same agent, further event-free wakes are held back for an escalating
  * cooldown anchored to the last run's finish time. Fresh issue activity, an
  * explicit resume, forceFreshSession, and event-carrying wake reasons bypass
- * the throttle. Human comment wakes also bypass it. Agent-authored comment
- * wakes deliberately stay in the normal throttle class so a cross-issue write
- * cannot smuggle human wake privileges.
+ * the throttle. Comment wakes bypass it **only** when authored by a genuine
+ * external human actor (an authenticated session / board key / cloud tenant),
+ * whose legitimate back-and-forth must never be throttled. Agent-authored
+ * comment wakes deliberately stay in the normal throttle class so a cross-issue
+ * write cannot smuggle human wake privileges, and — the COR-2416/COR-2419 loop
+ * class — a comment laundered onto the implicit `local-board` default actor is
+ * likewise not genuine, so it stays a throttle candidate too. This is the
+ * structural backstop: even if an upstream attribution fix is bypassed and a
+ * self-authored digest keeps reopening a blocked issue as a "user" comment, the
+ * streak still builds and the loop dies within the cooldown bound instead of
+ * running until the productivity detector fires.
  *
  * Server-side recovery retries (process-loss retries, missing-comment
  * follow-ups) insert their runs directly and never pass through this gate, so
  * crash recovery stays immediate; only repeated no-op re-invocations slow
  * down.
  */
+
+/**
+ * The `local_trusted` implicit board default actor id (`local-board`). A request
+ * that carries no bearer and no resolvable run header is attributed to this
+ * synthetic instance-admin "user"; a genuine person using the board UI
+ * authenticates as a real session user instead. Activity attributed to this id
+ * is therefore treated as laundered/system, never as genuine external input.
+ * (Mirrors `LOCAL_BOARD_USER_ID` in `index.ts`.)
+ */
+export const LOCAL_IMPLICIT_BOARD_ACTOR_ID = "local-board";
+
+/**
+ * Actor sources that identify a *genuine external human* — an authenticated
+ * board session, a board API key, or a cloud tenant owner. A `user`-type actor
+ * on any other source (notably the `local_implicit` `local-board` default) is
+ * not genuine and does not earn the human throttle bypass.
+ */
+export const GENUINE_EXTERNAL_HUMAN_ACTOR_SOURCES: ReadonlySet<string> = new Set([
+  "session",
+  "board_key",
+  "cloud_tenant",
+]);
+
+/**
+ * Whether a comment wake was authored by a genuine external human actor.
+ * Requires both a `user` actor type and a resolved human credential source;
+ * agent, system, and laundered `local_implicit` comments all fail this test.
+ */
+export function isGenuineExternalActorComment(input: {
+  requestedByActorType?: "user" | "agent" | "system" | null;
+  requestedByActorSource?: string | null;
+}): boolean {
+  return (
+    input.requestedByActorType === "user"
+    && typeof input.requestedByActorSource === "string"
+    && GENUINE_EXTERNAL_HUMAN_ACTOR_SOURCES.has(input.requestedByActorSource)
+  );
+}
 
 /** Consecutive no-progress runs required before the cooldown engages. */
 export const ISSUE_REWAKE_NO_PROGRESS_THRESHOLD = 2;
@@ -101,6 +147,15 @@ export interface IssueRewakeCandidateInput {
   reason: string | null;
   wakeCommentId: string | null;
   requestedByActorType?: "user" | "agent" | "system" | null;
+  /**
+   * The authorization source of the wake's requesting actor, when known. Used
+   * to distinguish a genuine external human comment from a laundered/system
+   * one; see {@link isGenuineExternalActorComment}. Absent (e.g. across a
+   * deferred-wake replay that only persists actor *type*) is treated as
+   * not-genuine, so the wake stays a throttle candidate — the reset query still
+   * lets any genuine human activity in the window clear the cooldown.
+   */
+  requestedByActorSource?: string | null;
   forceFreshSession: boolean;
   hasExplicitResume: boolean;
 }
@@ -114,7 +169,20 @@ export function isThrottleCandidateIssueRewake(input: IssueRewakeCandidateInput)
   // Explicit resume is an operator privilege, not an actor-class escape hatch.
   // Agent-authored resume comments remain subject to the normal rewake throttle.
   if (input.hasExplicitResume && input.requestedByActorType !== "agent") return false;
-  if (input.wakeCommentId) return input.requestedByActorType === "agent";
+  if (input.wakeCommentId) {
+    // Agent-authored comment wakes stay throttle candidates so a cross-issue
+    // write cannot smuggle human wake privilege.
+    if (input.requestedByActorType === "agent") return true;
+    // A `user` comment is a candidate unless it is a genuine external human,
+    // whose legitimate back-and-forth must never be throttled. A laundered
+    // `local_implicit`/attribution-less "user" comment — the COR-2416/COR-2419
+    // reopen-loop engine — is NOT genuine and becomes a candidate. (COR-2419.)
+    if (input.requestedByActorType === "user") return !isGenuineExternalActorComment(input);
+    // System/bridge-emitted comment wakes keep their existing bypass: a monitor
+    // or integration posting a genuinely new comment must still wake the agent,
+    // and such a comment is recorded as new issue input that resets any streak.
+    return false;
+  }
   if (input.reason === null) return true;
   return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason);
 }

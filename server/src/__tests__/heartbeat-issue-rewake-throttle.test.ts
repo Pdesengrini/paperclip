@@ -321,6 +321,111 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     expect(admittedAfterHumanInput).not.toBeNull();
   });
 
+  it("dies structurally on a laundered local-board self-digest reopen loop (COR-2419)", async () => {
+    // Simulates the COR-2416 loop with the P1 attribution fix bypassed: the
+    // reopen comment is attributed to the implicit `local-board` default actor,
+    // so it arrives as a `user` comment with source `local_implicit`. Its own
+    // comment must not reset the cooldown, and the wake it drives must be
+    // throttled — the loop dies within the cooldown bound instead of running
+    // until the productivity detector fires.
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+
+    // The loop's own laundered digest, logged after the last run finished.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "local-board",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+    });
+
+    const launderedCommentId = randomUUID();
+    const throttledLaunderedWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_reopened_via_comment",
+      payload: { issueId, commentId: launderedCommentId },
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_reopened_via_comment",
+        wakeCommentId: launderedCommentId,
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      requestedByActorSource: "local_implicit",
+    });
+
+    expect(throttledLaunderedWake).toBeNull();
+    expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
+  });
+
+  it("never throttles a genuine external human reopen comment during a no-progress streak (COR-2419, Invariant 1)", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+
+    // An authenticated human's reopen comment bypasses the throttle outright,
+    // even though the streak would otherwise throttle an event-free wake.
+    const humanCommentId = randomUUID();
+    const humanWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_reopened_via_comment",
+      payload: { issueId, commentId: humanCommentId },
+      contextSnapshot: { issueId, wakeReason: "issue_reopened_via_comment", wakeCommentId: humanCommentId },
+      requestedByActorType: "user",
+      requestedByActorId: randomUUID(),
+      requestedByActorSource: "session",
+    });
+    expect(humanWake).not.toBeNull();
+  });
+
+  it("admits a laundered wake once a genuine human comment resets the cooldown (COR-2419)", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+
+    const launderedWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_reopened_via_comment",
+      payload: { issueId, commentId: randomUUID() },
+      contextSnapshot: { issueId, wakeReason: "issue_reopened_via_comment", wakeCommentId: randomUUID() },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      requestedByActorSource: "local_implicit",
+    });
+    expect(launderedWake).toBeNull();
+
+    // A genuine human comment (real actor id, not the laundered `local-board`)
+    // is new external input that resets the cooldown.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: randomUUID(),
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+    });
+    const admittedAfterHumanInput = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_reopened_via_comment",
+      payload: { issueId, commentId: randomUUID() },
+      contextSnapshot: { issueId, wakeReason: "issue_reopened_via_comment", wakeCommentId: randomUUID() },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      requestedByActorSource: "local_implicit",
+    });
+    expect(admittedAfterHumanInput).not.toBeNull();
+  });
+
   it("keeps agent-authored explicit resume comments inside the no-progress cooldown", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
 

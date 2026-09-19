@@ -157,6 +157,7 @@ import { emitAgentTaskRun } from "../services/agent-task-run-telemetry.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
+import { GENUINE_EXTERNAL_HUMAN_ACTOR_SOURCES } from "../services/issue-rewake-throttle.js";
 import {
   decideIssueReviewPathRecovery,
   ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
@@ -1935,15 +1936,6 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // edits — flipping to todo here would contradict the caller's stated intent
   // in the same request.
   if (input.requestAddsExplicitBlockers) return false;
-  // `local_implicit` is the `local_trusted` default actor (`local-board`) used
-  // whenever a request carries no bearer and no resolvable run header. An agent
-  // tool call that omits its credential lands here (COR-2877/COR-2890) and would
-  // otherwise masquerade as a human comment that reopens the very issue the run
-  // just closed — the infinite wake loop. Such an ambiguous, unauthenticated
-  // fallback must never *implicitly* reopen finished agent work; a genuine
-  // reopen still travels the explicit `reopen: true` / `resume: true` path,
-  // which bypasses this predicate. (COR-2890.)
-  if (input.actorSource === "local_implicit") return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
   // even though the comment originates from the same heartbeat run that owns
   // the issue lock. Without this guard, an agent that closes its own issue and
@@ -1960,6 +1952,18 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
+  // Positive gate: only a *genuine external human* actor may implicitly reopen
+  // finished/blocked work (COR-2416 §3 contract, COR-2419). A `user` actor is
+  // genuine iff it carries a resolved human credential source — an
+  // authenticated session, board key, or cloud tenant. The `local_implicit`
+  // `local-board` default (the `local_trusted` fallback used whenever a request
+  // carries no bearer and no resolvable run header, COR-2877/COR-2890) and any
+  // future unattributed system/bridge `user` fallback are NOT genuine and must
+  // never *implicitly* reopen: they would masquerade as a human comment that
+  // reopens the very issue the run just closed — the infinite wake loop. A
+  // genuine reopen by such an author still travels the explicit `reopen: true`
+  // / `resume: true` path, which bypasses this predicate.
+  if (!GENUINE_EXTERNAL_HUMAN_ACTOR_SOURCES.has(input.actorSource ?? "")) return false;
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
@@ -10359,6 +10363,7 @@ export function issueRoutes(
             assigneeAgentId: requestedAssigneeAgentId,
             actorType: actor.actorType,
             actorId: actor.actorId,
+            actorSource: actor.actorType === "user" ? actor.actorSource : undefined,
             actorRunId: actor.runId,
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
@@ -11642,6 +11647,8 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            requestedByActorSource:
+              actor.actorType === "user" ? actor.actorSource : undefined,
             contextSnapshot: {
               issueId: id,
               taskId: id,
@@ -14258,6 +14265,8 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            requestedByActorSource:
+              actor.actorType === "user" ? actor.actorSource : undefined,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,
@@ -14291,6 +14300,8 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            requestedByActorSource:
+              actor.actorType === "user" ? actor.actorSource : undefined,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,

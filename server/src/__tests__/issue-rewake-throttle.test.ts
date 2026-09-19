@@ -5,6 +5,7 @@ import {
   ISSUE_REWAKE_NO_PROGRESS_THRESHOLD,
   computeIssueRewakeCooldownMs,
   evaluateIssueRewakeThrottle,
+  isGenuineExternalActorComment,
   isThrottleCandidateIssueRewake,
 } from "../services/issue-rewake-throttle.ts";
 
@@ -46,11 +47,49 @@ describe("isThrottleCandidateIssueRewake", () => {
       wakeCommentId: "comment-1",
       requestedByActorType: "agent",
     })).toBe(true);
+  });
+
+  it("bypasses the throttle only for a genuine external human comment (COR-2419)", () => {
+    for (const requestedByActorSource of ["session", "board_key", "cloud_tenant"]) {
+      expect(isThrottleCandidateIssueRewake({
+        ...base,
+        reason: "issue_reopened_via_comment",
+        wakeCommentId: "comment-1",
+        requestedByActorType: "user",
+        requestedByActorSource,
+      })).toBe(false);
+    }
+  });
+
+  it("keeps a laundered local_implicit 'user' comment throttle-eligible (COR-2419 loop engine)", () => {
+    // The self-digest reopen loop is attributed to the implicit `local-board`
+    // default actor — a `user` with no genuine credential source. It must stay a
+    // throttle candidate so the loop dies structurally.
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_reopened_via_comment",
+      wakeCommentId: "comment-1",
+      requestedByActorType: "user",
+      requestedByActorSource: "local_implicit",
+    })).toBe(true);
+    // A user comment with no source at all (e.g. across a deferred-wake replay)
+    // is likewise not genuine and stays a candidate.
     expect(isThrottleCandidateIssueRewake({
       ...base,
       reason: "issue_commented",
       wakeCommentId: "comment-1",
       requestedByActorType: "user",
+    })).toBe(true);
+  });
+
+  it("preserves the existing bypass for system-emitted comment wakes", () => {
+    // A monitor/bridge posting a genuinely new comment must still wake the
+    // agent; that comment is recorded as new issue input that resets any streak.
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_commented",
+      wakeCommentId: "comment-1",
+      requestedByActorType: "system",
     })).toBe(false);
   });
 
@@ -81,6 +120,36 @@ describe("isThrottleCandidateIssueRewake", () => {
     ]) {
       expect(isThrottleCandidateIssueRewake({ ...base, reason })).toBe(false);
     }
+  });
+});
+
+describe("isGenuineExternalActorComment", () => {
+  it("is true only for a user actor on a genuine human credential source", () => {
+    for (const requestedByActorSource of ["session", "board_key", "cloud_tenant"]) {
+      expect(isGenuineExternalActorComment({
+        requestedByActorType: "user",
+        requestedByActorSource,
+      })).toBe(true);
+    }
+  });
+
+  it("is false for laundered, agent, system, or source-less actors", () => {
+    expect(isGenuineExternalActorComment({
+      requestedByActorType: "user",
+      requestedByActorSource: "local_implicit",
+    })).toBe(false);
+    expect(isGenuineExternalActorComment({
+      requestedByActorType: "user",
+      requestedByActorSource: null,
+    })).toBe(false);
+    expect(isGenuineExternalActorComment({
+      requestedByActorType: "agent",
+      requestedByActorSource: "agent_key",
+    })).toBe(false);
+    expect(isGenuineExternalActorComment({
+      requestedByActorType: "system",
+      requestedByActorSource: "session",
+    })).toBe(false);
   });
 });
 

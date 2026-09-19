@@ -219,6 +219,21 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
   return app;
 }
 
+// A genuine external human board user: an authenticated board *session*, not the
+// `local_implicit` credential-less default. This is the actor a real person
+// carries when reopening/commenting through the board UI, and — per the
+// COR-2416 §3 contract (COR-2419) — the only user actor that may *implicitly*
+// reopen finished/blocked work. The implicit `local-board` default
+// (`source: "local_implicit"`) is treated as laundered/system and never
+// implicitly reopens.
+const GENUINE_HUMAN_BOARD_ACTOR = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "session",
+  isInstanceAdmin: false,
+};
+
 async function normalizePolicy(input: {
   stages: Array<{
     id: string;
@@ -466,7 +481,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
       makeIssueUpdateReceipt(issue, patch));
 
-    const res = await request(await installActor(createApp()))
+    const res = await request(await installActor(createApp(), GENUINE_HUMAN_BOARD_ACTOR))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ comment: "hello", assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
 
@@ -576,7 +591,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
       makeIssueUpdateReceipt(issue, patch));
 
-    const res = await request(await installActor(createApp()))
+    const res = await request(await installActor(createApp(), GENUINE_HUMAN_BOARD_ACTOR))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "hello" });
 
@@ -891,7 +906,7 @@ describe.sequential("issue comment reopen routes", () => {
       ...patch,
     }));
 
-    const res = await request(await installActor(createApp()))
+    const res = await request(await installActor(createApp(), GENUINE_HUMAN_BOARD_ACTOR))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "please continue" });
 
@@ -1382,7 +1397,7 @@ describe.sequential("issue comment reopen routes", () => {
       ...patch,
     }));
 
-    const res = await request(await installActor(createApp()))
+    const res = await request(await installActor(createApp(), GENUINE_HUMAN_BOARD_ACTOR))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ blockedByIssueIds: [], comment: "nothing left to wait on, please continue" });
 
@@ -1472,7 +1487,7 @@ describe.sequential("issue comment reopen routes", () => {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
-      source: "local_implicit",
+      source: "session",
       isInstanceAdmin: false,
       runId: "run-different",
     }))
@@ -1483,6 +1498,65 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
+    );
+  });
+
+  it("does not implicitly reopen a blocked issue via POST comments from a laundered local_implicit actor, even with a differing runId (COR-2419)", async () => {
+    // Isolates the source gate from P1's run-match gate: the runId differs from
+    // the issue's owning run (so run-match would allow a reopen), but the actor
+    // is the laundered `local_implicit` `local-board` default — not a genuine
+    // external human — so it must NOT implicitly reopen.
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("blocked"),
+      checkoutRunId: "run-owning",
+      executionRunId: "run-owning",
+    });
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+      runId: "run-different",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "laundered digest" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("does not implicitly reopen a blocked issue via the PATCH comment path from a laundered local_implicit actor (COR-2419)", async () => {
+    const issue = {
+      ...makeIssue("blocked"),
+      checkoutRunId: "run-owning",
+      executionRunId: "run-owning",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+      runId: "run-different",
+    }))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "laundered digest" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
     );
   });
 
@@ -1522,7 +1596,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
       makeIssueUpdateReceipt(issue, patch));
 
-    const res = await request(await installActor(createApp()))
+    const res = await request(await installActor(createApp(), GENUINE_HUMAN_BOARD_ACTOR))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ comment: "please continue" });
 

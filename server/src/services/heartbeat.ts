@@ -232,7 +232,9 @@ import {
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
+  LOCAL_IMPLICIT_BOARD_ACTOR_ID,
   evaluateIssueRewakeThrottle,
+  isGenuineExternalActorComment,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import {
@@ -3384,6 +3386,14 @@ interface WakeupOptions {
   idempotencyKey?: string | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  /**
+   * Authorization source of the requesting actor, when known (COR-2419). Lets
+   * the rewake throttle tell a genuine external human comment apart from a
+   * laundered `local_implicit` "user" comment. Only threaded in-process on the
+   * comment-wake path; a deferred-wake replay omits it (see
+   * {@link IssueRewakeCandidateInput.requestedByActorSource}).
+   */
+  requestedByActorSource?: string | null;
   contextSnapshot?: Record<string, unknown>;
   issueStateGuard?: {
     statuses: string[];
@@ -24785,6 +24795,7 @@ export function heartbeatService(
             reason,
             wakeCommentId: wakeCommentId ?? null,
             requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorSource: opts.requestedByActorSource ?? null,
             forceFreshSession:
               enrichedContextSnapshot.forceFreshSession === true,
             hasExplicitResume: Boolean(explicitResumeSession),
@@ -24844,8 +24855,26 @@ export function heartbeatService(
                         activityLog.action,
                         ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
                       ),
-                      wakeCommentId && opts.requestedByActorType === "agent"
-                        ? ne(activityLog.actorType, "agent")
+                      // When this wake is a comment that is NOT from a genuine
+                      // external human, only genuine external input may reset
+                      // the cooldown (COR-2419). Exclude both agent-authored
+                      // activity and the laundered `local-board` default actor
+                      // so a self/system digest loop cannot reset its own
+                      // throttle by posting the very comment that re-woke it —
+                      // whether that comment lands as an `agent` (attribution
+                      // fix in place) or a laundered `user`/`local-board`
+                      // comment (attribution fix bypassed). A genuine human's
+                      // comment carries a real actor id and still counts.
+                      wakeCommentId &&
+                      !isGenuineExternalActorComment({
+                        requestedByActorType: opts.requestedByActorType ?? null,
+                        requestedByActorSource:
+                          opts.requestedByActorSource ?? null,
+                      })
+                        ? and(
+                            ne(activityLog.actorType, "agent"),
+                            ne(activityLog.actorId, LOCAL_IMPLICIT_BOARD_ACTOR_ID),
+                          )
                         : undefined,
                     ),
                   )
@@ -24860,10 +24889,11 @@ export function heartbeatService(
                   .map((row) => row.runId)
                   .filter((runId): runId is string => Boolean(runId)),
               ),
-              // For an agent comment wake, the query excludes agent-authored
-              // activity while preserving genuinely new user/system input.
-              // Presentation/author metadata therefore cannot smuggle human
-              // wake privilege, nor can it mask an actual human response.
+              // For a non-genuine comment wake (agent-authored, or laundered onto
+              // the `local-board` default), the query excludes that actor's own
+              // activity while preserving genuinely new external human/system
+              // input. Presentation/author metadata therefore cannot smuggle
+              // human wake privilege, nor can it mask an actual human response.
               hasNewIssueInputSinceLastRun: newInputRows.length > 0,
             });
 

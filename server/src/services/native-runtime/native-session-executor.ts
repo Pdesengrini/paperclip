@@ -998,9 +998,12 @@ export function createGovernedWaitEventObservation(
       observation = null;
       const kind = record(event.payload).kind;
       const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
-      if (tool && event.itemId) {
-        if (event.eventType === "item.started") pendingTools.add(event.itemId);
-        if (event.eventType === "item.completed") pendingTools.delete(event.itemId);
+      if (event.itemId) {
+        if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
+        // Terminal error events can omit kind; the tracked ID owns cleanup.
+        if (event.eventType === "item.completed" || event.eventType === "item.failed") {
+          pendingTools.delete(event.itemId);
+        }
       }
       // Usage/model messages can arrive while the tool creating the card is
       // still awaiting its response. Parking then interrupts that in-flight

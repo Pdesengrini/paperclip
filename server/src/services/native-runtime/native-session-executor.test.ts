@@ -4128,6 +4128,11 @@ describe("native governed waits", () => {
       payload: { kind: "dynamicToolCall" },
     };
 
+    // A failed tool is terminal too, even when its error event omits kind.
+    // It must not block the later approval tool from parking this run.
+    await observation.observe({ ...replayedEvent, eventType: "item.started", itemId: "failed-command", payload: { kind: "commandExecution" } }, false);
+    await observation.observe({ ...replayedEvent, eventType: "item.failed", itemId: "failed-command", payload: { error: "Command exited with status 1" } }, false);
+
     // A usage event must not park while the card-creation response is held.
     await observation.observe({ ...replayedEvent, eventType: "item.started", itemId: "approval-tool" }, false);
     const usage = { ...replayedEvent, payload: { kind: "usage" } };

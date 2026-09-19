@@ -2358,6 +2358,8 @@ export async function executeNativeSession(
           }
           await session.startTurn({
             message: { role: "user", text: JSON.stringify(modelEnvelope) },
+            ...(recovered && modelEnvelope.schema === "paperclip.native-continuation.v1"
+              ? { continuation: true as const } : {}),
             requestedCollaborationMode:
               "executionMode" in input ? input.executionMode : "default",
           });

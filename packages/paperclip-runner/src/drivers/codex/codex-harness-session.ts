@@ -137,6 +137,8 @@ export class CodexHarnessSession
 
   async startTurn(input: {
     message: NativeUserMessage;
+    /** Set by orchestration only after successful provider-session recovery. */
+    continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
   }): Promise<{
     turnId: string;
@@ -163,8 +165,7 @@ export class CodexHarnessSession
     // A native continuation already carries just new events and the current
     // completion IDs. Do not wrap it in the prior task objective/constraints
     // or re-invoke a skill whose instructions are already in this session.
-    let continuationTurn = false;
-    try { continuationTurn = record(JSON.parse(input.message.text)).schema === "paperclip.native-continuation.v1"; } catch { /* Ordinary text. */ }
+    const continuationTurn = input.continuation === true;
     const turnSkills = continuationTurn ? [] : this.skillInputs;
     const taskText =
       this.conversationMode === "direct"

@@ -1560,6 +1560,89 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recoveryIssues[0]?.status).toBe("blocked");
   });
 
+  it("does not let a parent⇄child blocker loop abort startup recovery", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    // The parent is stranded (blocked with no first-class blocker) and already
+    // carries an active recovery action.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: sourceIssueId,
+      title: "Healthy child with a live execution path",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    // The child is healthy: a queued wake gives it an active execution path, so
+    // the reconciler would otherwise re-point the parent's blockers at it.
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      source: "automation",
+      reason: "issue_continuation_needed",
+      status: "queued",
+      payload: { issueId: childIssueId },
+    });
+    // The parent already blocks the child. Writing child-blocks-parent would
+    // close a parent⇄child cycle and used to throw a fatal 422.
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: sourceIssueId,
+      relatedIssueId: childIssueId,
+      type: "blocks",
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:cycle-inducing-healthy-child",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: {
+        type: "bounded_recovery_owner",
+        ownerAgentId: managerId,
+        attempt: 1,
+        maxAttempts: 5,
+      },
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    // Must not throw: one issue's cycle must never abort the whole recovery pass.
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    const childBlocksParent = await db
+      .select()
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.issueId, childIssueId),
+          eq(issueRelations.relatedIssueId, sourceIssueId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    expect(childBlocksParent).toHaveLength(0);
+    // The repair stays active so a later reconcile can heal it once the blocker
+    // graph is acyclic.
+    const [actionAfter] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionAfter).toMatchObject({ status: "active", outcome: null, resolvedAt: null });
+  });
+
   it("exposes active recovery actions on the issue read API", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);

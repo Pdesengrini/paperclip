@@ -4494,6 +4494,62 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+/**
+ * Stable error code attached to a blocking-cycle rejection so callers can tell
+ * it apart from other 422s without matching on the human-readable message.
+ */
+export const BLOCKING_CYCLE_ERROR_CODE = "blocking_cycle";
+
+/**
+ * Returns the subset of `blockerIssueIds` whose addition to `issueId`'s
+ * blocked-by set would close a cycle in the company's blocking graph.
+ *
+ * This mirrors the exact traversal used by `assertNoBlockingCycles` so callers
+ * that build a blocked-by set dynamically (recovery/reconcile paths) can drop
+ * loop-closing candidates before calling `update`, instead of letting the 422
+ * abort an entire startup recovery pass (COR-3013).
+ */
+export async function findBlockingCycleBlockers(
+  dbOrTx: DbReader,
+  companyId: string,
+  issueId: string,
+  blockerIssueIds: string[],
+): Promise<string[]> {
+  if (blockerIssueIds.length === 0) return [];
+
+  const rows = await dbOrTx
+    .select({
+      blockerIssueId: issueRelations.issueId,
+      blockedIssueId: issueRelations.relatedIssueId,
+    })
+    .from(issueRelations)
+    .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+
+  const adjacency = new Map<string, string[]>();
+  for (const row of rows) {
+    const list = adjacency.get(row.blockerIssueId) ?? [];
+    list.push(row.blockedIssueId);
+    adjacency.set(row.blockerIssueId, list);
+  }
+
+  const offenders: string[] = [];
+  for (const blockerIssueId of blockerIssueIds) {
+    const queue = [...(adjacency.get(issueId) ?? [])];
+    const visited = new Set<string>([issueId]);
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (current === blockerIssueId) {
+        offenders.push(blockerIssueId);
+        break;
+      }
+      if (visited.has(current)) continue;
+      visited.add(current);
+      queue.push(...(adjacency.get(current) ?? []));
+    }
+  }
+  return offenders;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -5187,35 +5243,17 @@ export function issueService(db: Db) {
     blockerIssueIds: string[],
     dbOrTx: DbReader = db,
   ) {
-    if (blockerIssueIds.length === 0) return;
-
-    const rows = await dbOrTx
-      .select({
-        blockerIssueId: issueRelations.issueId,
-        blockedIssueId: issueRelations.relatedIssueId,
-      })
-      .from(issueRelations)
-      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
-
-    const adjacency = new Map<string, string[]>();
-    for (const row of rows) {
-      const list = adjacency.get(row.blockerIssueId) ?? [];
-      list.push(row.blockedIssueId);
-      adjacency.set(row.blockerIssueId, list);
-    }
-
-    for (const blockerIssueId of blockerIssueIds) {
-      const queue = [...(adjacency.get(issueId) ?? [])];
-      const visited = new Set<string>([issueId]);
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        if (current === blockerIssueId) {
-          throw unprocessable("Blocking relations cannot contain cycles");
-        }
-        if (visited.has(current)) continue;
-        visited.add(current);
-        queue.push(...(adjacency.get(current) ?? []));
-      }
+    const cycleBlockerIssueIds = await findBlockingCycleBlockers(
+      dbOrTx,
+      companyId,
+      issueId,
+      blockerIssueIds,
+    );
+    if (cycleBlockerIssueIds.length > 0) {
+      throw unprocessable("Blocking relations cannot contain cycles", {
+        code: BLOCKING_CYCLE_ERROR_CODE,
+        cycleBlockerIssueIds,
+      });
     }
   }
 

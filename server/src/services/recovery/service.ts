@@ -28,7 +28,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
@@ -39,7 +39,12 @@ import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import {
+  BLOCKING_CYCLE_ERROR_CODE,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  findBlockingCycleBlockers,
+  issueService,
+} from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -311,6 +316,19 @@ function readConfigurationIncompleteFingerprint(latestRun: LatestIssueRun): stri
 }
 
 export type { RunOutputSilenceSummary, WatchdogDecisionActor };
+
+/**
+ * True when `err` is the blocking-cycle rejection raised by
+ * `syncBlockedByIssueIds`/`assertNoBlockingCycles`. Recovery reconciles treat
+ * this as a skippable data anomaly instead of a fatal startup failure
+ * (COR-3013).
+ */
+function isBlockingCycleRejection(err: unknown): boolean {
+  if (!(err instanceof HttpError) || err.status !== 422) return false;
+  const details = err.details as { code?: unknown } | null | undefined;
+  return details?.code === BLOCKING_CYCLE_ERROR_CODE
+    || err.message === "Blocking relations cannot contain cycles";
+}
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -1834,13 +1852,53 @@ export function recoveryService(
       existingUnresolvedBlockerIssues(issue.companyId, issue.id),
       openChildIssues(issue),
     ]);
-    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
-    if (blockedByIssueIds.length === 0) return null;
+    const desiredBlockerIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
+    if (desiredBlockerIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    // Never close a blocking loop here: startup recovery must not throw a 422
+    // because the issue already blocks one of its open children (COR-3013).
+    const cycleBlockerIds = await findBlockingCycleBlockers(
+      db,
+      issue.companyId,
+      issue.id,
+      desiredBlockerIssueIds,
+    );
+    const blockedByIssueIds = desiredBlockerIssueIds.filter(
+      (id) => id !== issue.id && !cycleBlockerIds.includes(id),
+    );
+    if (blockedByIssueIds.length === 0) {
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          cycleBlockerIssueIds: cycleBlockerIds,
+        },
+        "recovery skipped continuation-wait reconcile: every candidate blocker would close a cycle",
+      );
+      return null;
+    }
+
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>> = null;
+    try {
+      updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    } catch (err) {
+      if (isBlockingCycleRejection(err)) {
+        logger.warn(
+          { err, companyId: issue.companyId, issueId: issue.id },
+          "recovery skipped continuation-wait reconcile after a blocker-cycle rejection",
+        );
+        return null;
+      }
+      throw err;
+    }
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    const droppedBlockerIssueIds = new Set(
+      desiredBlockerIssueIds.filter((id) => !blockedByIssueIds.includes(id)),
+    );
+    const waitingOn = formatIssueLinksForComment(
+      [...openChildren, ...existingBlockers].filter((row) => !droppedBlockerIssueIds.has(row.id)),
+    );
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -2272,15 +2330,68 @@ export function recoveryService(
       ]);
       const durablePathRestored = action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
       if (durablePathRestored || healthyChildren.length > 0 || hasNewSourcePath) {
+        let blockedByEstablished = !(healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath);
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [...new Set([
-              ...blockerIds,
-              ...healthyChildren.map((child) => child.id),
-            ])],
-          });
+          const desiredBlockerIds = [...new Set([
+            ...blockerIds,
+            ...healthyChildren.map((child) => child.id),
+          ])];
+          // A parent⇄child loop already present in the blocker graph must never
+          // make startup recovery throw a 422. Drop the loop-closing candidates
+          // up front and keep the rest of the wait intact. (COR-3013)
+          const cycleBlockerIds = await findBlockingCycleBlockers(
+            db,
+            issue.companyId,
+            issue.id,
+            desiredBlockerIds,
+          );
+          const safeBlockerIds = desiredBlockerIds.filter(
+            (id) => id !== issue.id && !cycleBlockerIds.includes(id),
+          );
+          if (cycleBlockerIds.length > 0) {
+            logger.warn(
+              {
+                companyId: action.companyId,
+                sourceIssueId: action.sourceIssueId,
+                recoveryActionId: action.id,
+                cycleBlockerIssueIds: cycleBlockerIds,
+              },
+              "startup recovery reconcile dropped blocker candidates that would close a blocking cycle",
+            );
+          }
+          if (safeBlockerIds.length > 0) {
+            try {
+              await issuesSvc.update(issue.id, {
+                status: "blocked",
+                blockedByIssueIds: safeBlockerIds,
+              });
+              blockedByEstablished = true;
+            } catch (err) {
+              // Defense in depth: the graph can change between the pre-check and
+              // the write. Never let one issue's reconcile abort startup recovery.
+              if (isBlockingCycleRejection(err)) {
+                logger.warn(
+                  {
+                    err,
+                    companyId: action.companyId,
+                    sourceIssueId: action.sourceIssueId,
+                    recoveryActionId: action.id,
+                  },
+                  "startup recovery reconcile skipped a blocker-cycle rejection",
+                );
+              } else {
+                throw err;
+              }
+            }
+          }
+        }
+        // If the only durable path was a loop-closing child we could not record,
+        // leave the recovery action active (skipped) so a later pass can heal it
+        // once the blocker graph is acyclic.
+        if (!blockedByEstablished && !durablePathRestored && !hasNewSourcePath) {
+          result.skipped += 1;
+          continue;
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -2290,7 +2401,7 @@ export function recoveryService(
           outcome: "restored",
           resolutionNote: durablePathRestored
             ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
-            : healthyChildren.length > 0
+            : healthyChildren.length > 0 && blockedByEstablished
               ? "durable_path_restored:healthy_child"
               : "new_source_execution_path",
         });

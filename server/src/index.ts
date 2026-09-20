@@ -1398,6 +1398,12 @@ async function startServerWithDatabaseTeardown(
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
+      // Native runner restart recovery is the one startup step that must fail
+      // closed (it rethrows below so we never double-run adopted native runs).
+      // Every other reconciliation is best-effort: a data anomaly must not make
+      // the server unbootable, because recovery is the parent of every agent
+      // (COR-3013).
+      let startupRecoveryFailedClosed = false;
       const startupHeartbeatRecovery = (async () => {
         try {
           const nativeRecovery =
@@ -1419,6 +1425,7 @@ async function startServerWithDatabaseTeardown(
             );
           }
         } catch (err) {
+          startupRecoveryFailedClosed = true;
           logger.error(
             { err },
             "startup native runner restart recovery failed closed",
@@ -1525,8 +1532,14 @@ async function startServerWithDatabaseTeardown(
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
       })().catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
-        throw err;
+        if (startupRecoveryFailedClosed) {
+          logger.error({ err }, "startup heartbeat recovery failed closed");
+          throw err;
+        }
+        logger.error(
+          { err },
+          "startup heartbeat recovery failed - continuing boot with degraded recovery",
+        );
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
       await startupHeartbeatRecovery;

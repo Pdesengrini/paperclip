@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -1624,6 +1625,106 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionAfter).toMatchObject({ status: "active", outcome: null, resolvedAt: null });
+  });
+
+  it("rate-limits the blocker-cycle warning for a permanently loop-closing candidate (COR-3016)", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    // The parent is stranded (blocked with no first-class blocker) and carries a
+    // board-escalated recovery action.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: sourceIssueId,
+      title: "Healthy child with a live execution path",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      source: "automation",
+      reason: "issue_continuation_needed",
+      status: "queued",
+      payload: { issueId: childIssueId },
+    });
+    // The parent already blocks the child, so the only healthy-child blocker
+    // candidate closes a parent⇄child cycle and can never be recorded durably.
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: sourceIssueId,
+      relatedIssueId: childIssueId,
+      type: "blocks",
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:permanent-cycle-healthy-child",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Inspect the evidence and choose whether to repair or reassign.",
+      wakePolicy: { type: "board_escalation", reason: "disposition_repair_exhausted" },
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const CYCLE_WARNING =
+      "startup recovery reconcile dropped blocker candidates that would close a blocking cycle";
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const cycleWarnings = () =>
+      (warnSpy.mock.calls as unknown as unknown[][]).filter((call) => call.includes(CYCLE_WARNING));
+    try {
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(cycleWarnings()).toHaveLength(1);
+
+      // A second reconcile tick re-derives the identical loop-closing candidate
+      // set. The stuck state must not keep flooding the log every ~30s.
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(cycleWarnings()).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    // The action stays active (board attention) but now carries durable evidence
+    // explaining why no blocked-by path could be recorded.
+    const [actionAfter] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionAfter?.status).toBe("active");
+    expect(actionAfter?.evidence).toMatchObject({
+      latestRunId: "run-1",
+      unresolvableBlockedByCycle: {
+        reason: "unresolvable_via_blocked_by",
+        loopClosingOnly: true,
+        cycleBlockerIssueIds: [childIssueId],
+      },
+    });
+
+    // The legitimate user/agent-set parent-blocks-child edge is never broken and
+    // no reverse edge is written.
+    const childBlocksParent = await db
+      .select()
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.issueId, childIssueId),
+          eq(issueRelations.relatedIssueId, sourceIssueId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    expect(childBlocksParent).toHaveLength(0);
   });
 
   it("exposes active recovery actions on the issue read API", async () => {

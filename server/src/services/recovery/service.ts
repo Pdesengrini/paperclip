@@ -2281,6 +2281,53 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  const BLOCKED_BY_CYCLE_OBSERVATION_EVIDENCE_KEY = "unresolvableBlockedByCycle";
+
+  // COR-3016: bounded-convergence bookkeeping for blocker-cycle candidates.
+  // A recovery action whose healthy-child candidates all close a blocking cycle
+  // has no durable blocked-by path to record, so it stays active by design and
+  // every reconcile pass re-derives the same dropped candidate. Persist what was
+  // observed on the action (board-visible evidence) and report `changed: false`
+  // on identical repeat observations so callers stop re-emitting a per-pass
+  // warning for a permanently stuck state.
+  async function recordBlockerCycleObservation(
+    action: typeof issueRecoveryActions.$inferSelect,
+    cycleBlockerIssueIds: string[],
+    loopClosingOnly: boolean,
+  ) {
+    const evidence = parseObject(action.evidence);
+    const previous = parseObject(evidence[BLOCKED_BY_CYCLE_OBSERVATION_EVIDENCE_KEY]);
+    const fingerprint = [...cycleBlockerIssueIds].sort().join(",");
+    const unchanged =
+      readNonEmptyString(previous.fingerprint) === fingerprint &&
+      previous.loopClosingOnly === loopClosingOnly;
+    if (unchanged) return { changed: false, fingerprint };
+
+    const now = new Date();
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...evidence,
+          [BLOCKED_BY_CYCLE_OBSERVATION_EVIDENCE_KEY]: {
+            reason: "unresolvable_via_blocked_by",
+            loopClosingOnly,
+            fingerprint,
+            cycleBlockerIssueIds,
+            detectedAt: now.toISOString(),
+          },
+        },
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, action.id),
+          eq(issueRecoveryActions.companyId, action.companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    return { changed: true, fingerprint };
+  }
 
   async function reconcileActiveRecoveryActions() {
     const rows = await db
@@ -2350,15 +2397,36 @@ export function recoveryService(
             (id) => id !== issue.id && !cycleBlockerIds.includes(id),
           );
           if (cycleBlockerIds.length > 0) {
-            logger.warn(
-              {
-                companyId: action.companyId,
-                sourceIssueId: action.sourceIssueId,
-                recoveryActionId: action.id,
-                cycleBlockerIssueIds: cycleBlockerIds,
-              },
-              "startup recovery reconcile dropped blocker candidates that would close a blocking cycle",
+            // COR-3016: a permanently loop-closing candidate set makes this
+            // reconcile non-convergent by design (there is no durable blocked-by
+            // path to record, so the action must stay active for a later pass to
+            // heal). Record the observation on the action so the stuck state is
+            // durable/board-visible, and only surface the WARN when the observed
+            // cycle actually changes instead of on every ~30s reconcile tick.
+            const loopClosingOnly = safeBlockerIds.length === 0;
+            const blockerCycleObservation = await recordBlockerCycleObservation(
+              action,
+              cycleBlockerIds,
+              loopClosingOnly,
             );
+            const cycleLogPayload = {
+              companyId: action.companyId,
+              sourceIssueId: action.sourceIssueId,
+              recoveryActionId: action.id,
+              cycleBlockerIssueIds: cycleBlockerIds,
+              loopClosingOnly,
+            };
+            if (blockerCycleObservation.changed) {
+              logger.warn(
+                cycleLogPayload,
+                "startup recovery reconcile dropped blocker candidates that would close a blocking cycle",
+              );
+            } else {
+              logger.debug(
+                cycleLogPayload,
+                "startup recovery reconcile skipped unchanged blocker-cycle candidates",
+              );
+            }
           }
           if (safeBlockerIds.length > 0) {
             try {

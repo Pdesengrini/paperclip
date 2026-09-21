@@ -21714,17 +21714,22 @@ export function heartbeatService(
           persistedRunWrite.run;
         if (!persistedRunWrite.updated) {
           persistedRun = null;
-          // Native reconciliation can commit and project the terminal status in
+          // Another authority can commit and project the terminal status in
           // the narrow window between adapter completion and this live write.
-          // The status is authoritative, but it must not make us discard the
-          // adapter's semantic result, usage, logs, or presentation decision.
-          // Only complete the late metadata write when the reconciler chose the
-          // same terminal status; a conflicting terminal outcome remains owned
-          // by the path that won the compare-and-set.
-          if (
-            adapterResult.nativeFinalization &&
-            persistedRunWrite.run?.status === status
-          ) {
+          // Native reconciliation does it, and so does the recovery backstop
+          // (`terminalizeOrphanedRunningRun`), whose issue-terminal authority
+          // terminalizes a still-live run whose issue already reached a
+          // terminal status — the exact shape of every automation-continuation
+          // run on a reopened issue. The committed status is authoritative, but
+          // it must not make us discard the adapter's semantic result, usage,
+          // logs, or presentation decision, and it must not skip the
+          // liveness classification and `finalizeAgentStatus` below: without
+          // them the run keeps `livenessState: null` forever and the agent row
+          // keeps the run-start `running` status forever (COR-3099). Only
+          // complete the late metadata write when the other authority chose
+          // the same terminal status; a conflicting terminal outcome remains
+          // owned by the path that won the compare-and-set.
+          if (persistedRunWrite.run?.status === status) {
             persistedRun = await db
               .update(heartbeatRuns)
               .set({

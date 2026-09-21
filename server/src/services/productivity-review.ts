@@ -25,6 +25,7 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_GRACE_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -55,6 +56,7 @@ type ProductivityReviewThresholds = {
   highChurnHourly: number;
   highChurnSixHours: number;
   resolvedSnoozeMs: number;
+  monitorGraceMs: number;
   refreshIntervalMs: number;
   maxRefreshComments: number;
   creationWindowMs: number;
@@ -166,6 +168,10 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     resolvedSnoozeMs: readPositiveInteger(
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
+    ),
+    monitorGraceMs: readPositiveInteger(
+      overrides?.monitorGraceMs ?? DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_GRACE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_GRACE_MS,
     ),
     refreshIntervalMs: readPositiveInteger(
       overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -543,8 +549,21 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
+    // A scheduled issue monitor legitimately holds an issue in_progress across long
+    // sleeps between checks, so wall-clock active time is expected there. Suppress only
+    // the long_active_duration trigger while a monitor check is still pending (or only
+    // recently due) and nothing is actually executing. Once now passes
+    // monitorNextCheckAt + monitorGraceMs the monitor is treated as dead and the trigger
+    // applies again. no_comment_streak/high_churn are deliberately untouched: a monitor
+    // issue can still be genuinely broken.
+    const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
+    const monitorPending =
+      monitorNextCheckAt !== null &&
+      activeRunCount === 0 &&
+      now.getTime() <= monitorNextCheckAt.getTime() + thresholds.monitorGraceMs;
+
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActive = !monitorPending && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||

@@ -112,6 +112,10 @@ import {
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  DEFAULT_STRANDED_AGENT_STATUS_GRACE_MS,
+  decideAgentStatusReconciliation,
+} from "./agent-status-reconciliation.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -5801,6 +5805,29 @@ export function recoveryService(
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
 
+  // A heartbeat run row is only live when some real owner still holds it: the
+  // in-process execution handle, a durable native/legacy controller lease, or
+  // the recorded adapter process / process group. A row is never trusted on its
+  // own status. This is the single liveness predicate behind both the orphaned-
+  // run terminalizer and the stranded-agent-status watchdog, so the two
+  // backstops cannot disagree about what "live" means.
+  async function isRunGenuinelyLive(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<boolean> {
+    if (deps.liveRunExecutions?.has(run.id) ?? runningProcesses.has(run.id))
+      return true;
+    if (isNativeRunnerOwnershipHeld(run)) return true;
+    if (await hasLiveLegacyController(db, run)) return true;
+    const pid = run.processPid ?? null;
+    const processGroupId = run.processGroupId ?? null;
+    if (
+      (typeof pid === "number" && isPidAlive(pid)) ||
+      (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId))
+    )
+      return true;
+    return false;
+  }
+
   // Backstop reconciler: terminalizes a "running" run that can no longer reach a
   // terminal status on its own. The run finalizer writes the terminal status in
   // a step that is separate from the agent status=done PATCH. When the teardown
@@ -6214,6 +6241,138 @@ export function recoveryService(
     return result;
   }
 
+  // Stranded-agent-status watchdog. `agents.status = "running"` is written at
+  // execution start and only cleared by `finalizeAgentStatus` during run
+  // teardown. When a teardown never reaches that write (killed process, hot
+  // restart, or a run terminalized by another authority that won the run
+  // compare-and-set), the agent row keeps the `running` badge forever with no
+  // live execution behind it. Nothing used to read that column, so the only
+  // detector was a human sweep that had to be run by hand. This
+  // reconciles the agent record from observed run state and surfaces the
+  // correction: it never trusts the last write, only a genuinely live run.
+  // Idempotent and conservative — see `decideAgentStatusReconciliation`.
+  async function reconcileStrandedAgentStatuses(opts?: {
+    now?: Date;
+    companyId?: string | null;
+    graceMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const graceMs = Math.max(
+      0,
+      Math.floor(opts?.graceMs ?? DEFAULT_STRANDED_AGENT_STATUS_GRACE_MS),
+    );
+    const result = {
+      scanned: 0,
+      reconciled: 0,
+      agentIds: [] as string[],
+      skippedLive: 0,
+    };
+
+    const candidates = await db
+      .select({
+        id: agents.id,
+        companyId: agents.companyId,
+        name: agents.name,
+        reportsTo: agents.reportsTo,
+        status: agents.status,
+        lastHeartbeatAt: agents.lastHeartbeatAt,
+        updatedAt: agents.updatedAt,
+      })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.status, "running"),
+          opts?.companyId ? eq(agents.companyId, opts.companyId) : undefined,
+        ),
+      );
+    result.scanned = candidates.length;
+
+    for (const agent of candidates) {
+      const activeRunRows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agent.id),
+            inArray(heartbeatRuns.status, [
+              ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
+            ]),
+          ),
+        );
+      const activeRuns = [];
+      for (const row of activeRunRows) {
+        activeRuns.push({
+          status: row.status,
+          updatedAt: row.updatedAt,
+          live: await isRunGenuinelyLive(row),
+        });
+      }
+
+      const decision = decideAgentStatusReconciliation({
+        agent: {
+          status: agent.status,
+          lastHeartbeatAt: agent.lastHeartbeatAt,
+          updatedAt: agent.updatedAt,
+        },
+        activeRuns,
+        now,
+        graceMs,
+      });
+      if (!decision) {
+        if (activeRuns.some((run) => run.live)) result.skippedLive += 1;
+        continue;
+      }
+
+      // Compare-and-set on `running` so a concurrent dispatch that flipped the
+      // agent back to running (or a pause) is never overwritten.
+      const updated = await db
+        .update(agents)
+        .set({ status: decision.nextStatus, errorReason: null, updatedAt: now })
+        .where(and(eq(agents.id, agent.id), eq(agents.status, "running")))
+        .returning({ id: agents.id })
+        .then((rows) => rows[0] ?? null);
+      if (!updated) continue;
+
+      result.reconciled += 1;
+      result.agentIds.push(updated.id);
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "agent.status_reconciled_from_stale_running",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          source: "recovery.reconcile_stranded_agent_statuses",
+          agentName: agent.name,
+          reportsTo: agent.reportsTo,
+          previousStatus: agent.status,
+          nextStatus: decision.nextStatus,
+          reason: decision.reason,
+          lastActivityAt: decision.lastActivityAt.toISOString(),
+          graceMs,
+          activeRuns: activeRuns.map((run) => ({
+            status: run.status,
+            live: run.live,
+            updatedAt: run.updatedAt.toISOString(),
+          })),
+        },
+      });
+    }
+
+    if (result.reconciled > 0) {
+      logger.warn(
+        { ...result },
+        "reconciled agents stuck at running with no live run",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6223,6 +6382,7 @@ export function recoveryService(
     reconcileStrandedAssignedIssues,
     reconcileLegacyContinuation,
     legacyRepairDispatchBlock,
+    reconcileStrandedAgentStatuses,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,

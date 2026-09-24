@@ -21,6 +21,7 @@ import {
   issueThreadInteractions,
   issues,
   routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -141,6 +142,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
+    await db.delete(routineTriggers);
     await db.delete(routines);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
@@ -682,6 +684,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: coderId,
       priority: "medium",
     });
+    await db.insert(routineTriggers).values({
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    });
     await db
       .update(issues)
       .set({
@@ -712,6 +722,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     const [unchanged] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(unchanged).toMatchObject({ status: "in_progress", assigneeAgentId: coderId });
+  });
+
+  it("recovers an active routine execution issue whose routine has no enabled schedule", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Manual Poll",
+      status: "active",
+      assigneeAgentId: coderId,
+      priority: "medium",
+    });
+    // An active routine with only a manual/API trigger has no next fire, so its
+    // execution issue must fall through to normal recovery.
+    await db.insert(routineTriggers).values({
+      companyId,
+      routineId,
+      kind: "api",
+      enabled: true,
+      cronExpression: null,
+    });
+    await db
+      .update(issues)
+      .set({
+        originKind: "routine_execution",
+        originId: routineId,
+        originFingerprint: "default",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "succeeded",
+      resultJson: { stopReason: "completed" },
+      livenessState: "needs_followup",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.routinePollRearmed).toBe(0);
+    expect(enqueueWakeup).toHaveBeenCalled();
   });
 
   it("still recovers a stranded routine execution issue whose routine is not active", async () => {

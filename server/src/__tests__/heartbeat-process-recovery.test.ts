@@ -70,6 +70,7 @@ import {
   plugins,
   projects,
   projectWorkspaces,
+  routineTriggers,
   routines,
   statusDecisionEffects,
   statusDecisions,
@@ -546,6 +547,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(activityLog);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
+    await db.delete(routineTriggers);
     await db.delete(routines);
     await db.delete(costEvents);
     await db.delete(workspaceOperations);
@@ -5523,6 +5525,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "active",
       assigneeAgentId: agentId,
       priority: "medium",
+    });
+    await db.insert(routineTriggers).values({
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
     });
     await db
       .update(issues)

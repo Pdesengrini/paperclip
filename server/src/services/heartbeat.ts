@@ -497,6 +497,7 @@ import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
+import { activeScheduledRoutineIdForExecutionIssue } from "./recovery/routine-rearm-continuation.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
@@ -13494,30 +13495,31 @@ export function heartbeatService(
         ? treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)
         : Promise.resolve(null),
       issue
-        ? db
-            .select({ id: routines.id })
-            .from(routines)
-            .where(
-              and(
-                eq(routines.companyId, issue.companyId),
-                eq(routines.status, "active"),
-                // An active routine owns the next action either because it is
-                // parented to this issue, or because this issue *is* one of its
-                // one-shot `routine_execution` fires. In the latter case the
-                // routine's schedule is the poll re-arm: the next fire creates
-                // the next execution issue, so a successful scan that left no
-                // disposition here must not trigger a corrective handoff
-                // (COR-3258).
-                issue.originKind === "routine_execution" && issue.originId
-                  ? or(
-                      eq(routines.parentIssueId, issue.id),
-                      eq(routines.id, issue.originId),
-                    )
-                  : eq(routines.parentIssueId, issue.id),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null)
+        ? (async () => {
+            if (issue.originKind === "routine_execution" && issue.originId) {
+              // A still-enabled schedule is the poll re-arm for a one-shot
+              // `routine_execution` issue: the next fire creates the next
+              // execution issue, so a successful scan that left no disposition
+              // here must not trigger a corrective handoff (COR-3258). A
+              // manual-only or unscheduled routine has no next fire, so it
+              // falls through to the normal handoff below.
+              const scheduledRoutineId =
+                await activeScheduledRoutineIdForExecutionIssue(db, issue);
+              if (scheduledRoutineId) return { id: scheduledRoutineId };
+            }
+            return db
+              .select({ id: routines.id })
+              .from(routines)
+              .where(
+                and(
+                  eq(routines.companyId, issue.companyId),
+                  eq(routines.status, "active"),
+                  eq(routines.parentIssueId, issue.id),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+          })()
         : Promise.resolve(null),
     ]);
 

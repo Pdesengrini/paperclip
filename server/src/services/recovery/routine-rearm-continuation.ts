@@ -17,6 +17,9 @@ const ROUTINE_EXECUTION_ORIGIN_KIND = "routine_execution";
  * fire there is no automatic continuation, so treating the execution issue as
  * re-armed would leave it open with no disposition and no wake (review finding
  * on this change). In that case callers must fall through to normal recovery.
+ * The trigger must be enabled, not archived, and fully set up (not
+ * `setupPending`) — an archived or setup-pending trigger keeps its cron but
+ * never fires.
  *
  * Without this check the disposition watchdog hands a completed poll to the
  * correction path, which parks the issue `blocked` and escalates it to the
@@ -47,6 +50,8 @@ export async function activeScheduledRoutineIdForExecutionIssue(
         eq(routineTriggers.routineId, routines.id),
         eq(routineTriggers.companyId, routines.companyId),
         eq(routineTriggers.enabled, true),
+        eq(routineTriggers.archived, false),
+        eq(routineTriggers.setupPending, false),
         isNotNull(routineTriggers.cronExpression),
       ),
     )

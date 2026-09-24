@@ -123,6 +123,7 @@ import {
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import { activeScheduledRoutineIdForExecutionIssue } from "./routine-rearm-continuation.js";
+import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
@@ -3434,6 +3435,35 @@ export function recoveryService(
         continue;
       }
 
+      // A completed poll that the disposition watchdog previously parked
+      // `blocked` still carries its (often board-owned) recovery action. The
+      // routine's enabled schedule is the durable continuation, so finalize the
+      // one-shot execution here too instead of re-escalating a spurious action
+      // (COR-3260). This drains the pre-fix backlog that the stranded-issue scan
+      // cannot see because `blocked` is not one of its candidate statuses.
+      const pollLatestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const succeededPollRun = pollLatestRun?.status === "succeeded"
+        ? (pollLatestRun as SuccessfulLatestIssueRun)
+        : null;
+      const scheduledPollRoutineId =
+        succeededPollRun && issue.status !== "in_review"
+          ? await activeScheduledRoutineIdForExecutionIssue(db, issue)
+          : null;
+      if (succeededPollRun && scheduledPollRoutineId) {
+        const finalized = await finalizeCompletedRoutinePoll({
+          issue,
+          routineId: scheduledPollRoutineId,
+          latestRun: succeededPollRun,
+        });
+        if (finalized) {
+          result.resolved += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       // A queued comment or healthy child cannot establish what the stopped
       // provider already did. Only execution reconciliation can clear this hold.
       if (requiresExecutionReconciliation(action.cause)) {
@@ -4314,6 +4344,90 @@ export function recoveryService(
     );
   }
 
+  // Finalizes a one-shot `routine_execution` poll that the recovery scan
+  // accepted as a re-armed poll (COR-3260). The issue must reach `done` so the
+  // completed execution stops accumulating in Issues/Runs views, and the linked
+  // `routine_run` must reach `completed` — the issue route normally syncs that,
+  // but a service-layer status write bypasses it.
+  async function finalizeCompletedRoutinePoll(input: {
+    issue: typeof issues.$inferSelect;
+    routineId: string;
+    latestRun: SuccessfulLatestIssueRun;
+  }) {
+    const previousStatus = input.issue.status;
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "done",
+      companyGuard: input.issue.companyId,
+    });
+    if (!updated) return false;
+
+    await syncRoutineRunStatusForIssue(db, input.issue.id);
+
+    await issuesSvc.addComment(
+      input.issue.id,
+      "Poll completed; routine re-arms on its next fire.",
+      {},
+      {
+        authorType: "system",
+        presentation: {
+          kind: "system_notice",
+          tone: "success",
+          title: "Routine: poll complete — re-arms on next fire",
+          detailsDefaultOpen: false,
+          density: "compact",
+        },
+        metadata: {
+          version: 1,
+          sourceRunId: input.latestRun.id,
+          sections: [
+            {
+              title: "Routine",
+              rows: [
+                { type: "key_value", label: "Routine", value: input.routineId },
+                { type: "key_value", label: "Previous status", value: previousStatus },
+                { type: "run_link", label: "Latest run", runId: input.latestRun.id, title: "succeeded" },
+              ],
+            },
+          ],
+        },
+      },
+    );
+
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (activeRecoveryAction) {
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: input.issue.companyId,
+        sourceIssueId: input.issue.id,
+        actionId: activeRecoveryAction.id,
+        status: "resolved",
+        outcome: "owner_completed",
+        resolutionNote: "routine_poll_completed",
+      });
+    }
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: null,
+      runId: null,
+      action: "issue.routine_poll_completed",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        routineId: input.routineId,
+        previousStatus,
+        status: "done",
+        source: "recovery.reconcile_routine_poll",
+      },
+    });
+    return true;
+  }
+
   async function reconcileStrandedAssignedIssues(opts?: {
     issueCreatedAtGte?: Date | null;
   }) {
@@ -4681,12 +4795,29 @@ export function recoveryService(
       // and floods the board (COR-3258). An `in_review` execution issue is
       // excluded: it may be waiting on a review participant, and that recovery
       // path runs later in this loop.
-      if (
-        latestRun?.status === "succeeded" &&
-        issue.status !== "in_review" &&
-        (await activeScheduledRoutineIdForExecutionIssue(db, issue))
-      ) {
-        result.routinePollRearmed += 1;
+      //
+      // Accepting the poll must also *finish* it (COR-3260): the one-shot issue
+      // is not the durable continuation, so leaving it open accumulates
+      // completed executions and their `routine_runs` stay `issue_created`.
+      const succeededRun = latestRun?.status === "succeeded"
+        ? (latestRun as SuccessfulLatestIssueRun)
+        : null;
+      const scheduledRoutineId =
+        succeededRun && issue.status !== "in_review"
+          ? await activeScheduledRoutineIdForExecutionIssue(db, issue)
+          : null;
+      if (succeededRun && scheduledRoutineId) {
+        const finalized = await finalizeCompletedRoutinePoll({
+          issue,
+          routineId: scheduledRoutineId,
+          latestRun: succeededRun,
+        });
+        if (finalized) {
+          result.routinePollRearmed += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
         continue;
       }
       const recoveryNow = new Date();

@@ -122,6 +122,7 @@ import {
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
+import { activeOwningRoutineIdForExecutionIssue } from "./routine-rearm-continuation.js";
 import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
@@ -4350,6 +4351,7 @@ export function recoveryService(
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
+      routinePollRearmed: 0,
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
       skipped: 0,
@@ -4669,6 +4671,19 @@ export function recoveryService(
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
         result.skipped += 1;
+        continue;
+      }
+      // A routine execution issue whose owning routine is still active is a
+      // re-armed poll: the routine's next fire creates the next execution
+      // issue, so that schedule is the durable continuation. A successful
+      // scan that left this one-shot issue without a disposition is a valid
+      // terminal state — escalating it parks a completed poll `blocked` and
+      // floods the board (COR-3258).
+      if (
+        latestRun?.status === "succeeded" &&
+        (await activeOwningRoutineIdForExecutionIssue(db, issue))
+      ) {
+        result.routinePollRearmed += 1;
         continue;
       }
       const recoveryNow = new Date();

@@ -20,6 +20,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -140,6 +141,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
+    await db.delete(routines);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(environmentLeases);
@@ -668,6 +670,89 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
+
+  it("treats a successful routine execution scan as a re-armed poll, not a missing disposition", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "TestFlight Feedback Poll",
+      status: "active",
+      assigneeAgentId: coderId,
+      priority: "medium",
+    });
+    await db
+      .update(issues)
+      .set({
+        originKind: "routine_execution",
+        originId: routineId,
+        originFingerprint: "default",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "succeeded",
+      resultJson: { stopReason: "completed" },
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.routinePollRearmed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    const [unchanged] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(unchanged).toMatchObject({ status: "in_progress", assigneeAgentId: coderId });
+  });
+
+  it("still recovers a stranded routine execution issue whose routine is not active", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Archived Poll",
+      status: "archived",
+      assigneeAgentId: coderId,
+      priority: "medium",
+    });
+    await db
+      .update(issues)
+      .set({
+        originKind: "routine_execution",
+        originId: routineId,
+        originFingerprint: "default",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "succeeded",
+      resultJson: { stopReason: "completed" },
+      livenessState: "needs_followup",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.routinePollRearmed).toBe(0);
+    expect(enqueueWakeup).toHaveBeenCalled();
+  });
 
   it("stands down while the latest run was cancelled by a board operator", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();

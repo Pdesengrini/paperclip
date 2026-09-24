@@ -13320,6 +13320,7 @@ export function heartbeatService(
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
         originKind: issues.originKind,
+        originId: issues.originId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -13499,8 +13500,20 @@ export function heartbeatService(
             .where(
               and(
                 eq(routines.companyId, issue.companyId),
-                eq(routines.parentIssueId, issue.id),
                 eq(routines.status, "active"),
+                // An active routine owns the next action either because it is
+                // parented to this issue, or because this issue *is* one of its
+                // one-shot `routine_execution` fires. In the latter case the
+                // routine's schedule is the poll re-arm: the next fire creates
+                // the next execution issue, so a successful scan that left no
+                // disposition here must not trigger a corrective handoff
+                // (COR-3258).
+                issue.originKind === "routine_execution" && issue.originId
+                  ? or(
+                      eq(routines.parentIssueId, issue.id),
+                      eq(routines.id, issue.originId),
+                    )
+                  : eq(routines.parentIssueId, issue.id),
               ),
             )
             .limit(1)

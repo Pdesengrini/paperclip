@@ -4562,6 +4562,44 @@ export function recoveryService(
         continue;
       }
 
+      // A routine execution issue whose owning routine still has an enabled
+      // schedule is a re-armed poll: the routine's next fire creates the next
+      // execution issue, so that schedule is the durable continuation. A
+      // successful scan that left this one-shot issue without a disposition is
+      // a valid terminal state — escalating it parks a completed poll `blocked`
+      // and floods the board (COR-3258). An `in_review` execution issue is
+      // excluded: it may be waiting on a review participant, and that recovery
+      // path runs later in this loop.
+      //
+      // Accepting the poll must also *finish* it (COR-3260): the one-shot issue
+      // is not the durable continuation, so leaving it open accumulates
+      // completed executions and their `routine_runs` stay `issue_created`.
+      //
+      // This must run ahead of `reconcileLegacyContinuation`: a completed
+      // scheduled poll is a re-armed continuation, not a stranded legacy run,
+      // so it must not be queued for another provider turn or escalated.
+      const succeededRun = latestRun?.status === "succeeded"
+        ? (latestRun as SuccessfulLatestIssueRun)
+        : null;
+      const scheduledRoutineId =
+        succeededRun && issue.status !== "in_review"
+          ? await activeScheduledRoutineIdForExecutionIssue(db, issue)
+          : null;
+      if (succeededRun && scheduledRoutineId) {
+        const finalized = await finalizeCompletedRoutinePoll({
+          issue,
+          routineId: scheduledRoutineId,
+          latestRun: succeededRun,
+        });
+        if (finalized) {
+          result.routinePollRearmed += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
@@ -4785,39 +4823,6 @@ export function recoveryService(
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
         result.skipped += 1;
-        continue;
-      }
-      // A routine execution issue whose owning routine still has an enabled
-      // schedule is a re-armed poll: the routine's next fire creates the next
-      // execution issue, so that schedule is the durable continuation. A
-      // successful scan that left this one-shot issue without a disposition is
-      // a valid terminal state — escalating it parks a completed poll `blocked`
-      // and floods the board (COR-3258). An `in_review` execution issue is
-      // excluded: it may be waiting on a review participant, and that recovery
-      // path runs later in this loop.
-      //
-      // Accepting the poll must also *finish* it (COR-3260): the one-shot issue
-      // is not the durable continuation, so leaving it open accumulates
-      // completed executions and their `routine_runs` stay `issue_created`.
-      const succeededRun = latestRun?.status === "succeeded"
-        ? (latestRun as SuccessfulLatestIssueRun)
-        : null;
-      const scheduledRoutineId =
-        succeededRun && issue.status !== "in_review"
-          ? await activeScheduledRoutineIdForExecutionIssue(db, issue)
-          : null;
-      if (succeededRun && scheduledRoutineId) {
-        const finalized = await finalizeCompletedRoutinePoll({
-          issue,
-          routineId: scheduledRoutineId,
-          latestRun: succeededRun,
-        });
-        if (finalized) {
-          result.routinePollRearmed += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
         continue;
       }
       const recoveryNow = new Date();

@@ -5565,6 +5565,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
+    // Drain the queued execution so this test's run settles here instead of
+    // leaking a queued dispatch into the next test's `drainActiveRunExecutions`.
+    await heartbeat.drainActiveRunExecutions();
     await waitForRunToSettle(heartbeat, runId, 5_000);
     await waitForHeartbeatIdle(db, 5_000);
 

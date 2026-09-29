@@ -5206,6 +5206,53 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   );
 }
 
+export const ZERO_TOKEN_PROVIDER_FAILURE_ERROR_CODE =
+  "provider_zero_token_completion";
+export const ZERO_TOKEN_PROVIDER_FAILURE_ERROR_MESSAGE =
+  "Run exited cleanly but the provider billed zero tokens (no input, cached, or output) — the request never reached the model. This is the silent signature of a provider/billing rejection (4xx: balance/quota/plan). See COR-3538.";
+
+/**
+ * COR-3538: A run that exits 0 with no adapter error but whose adapter reported
+ * usage totals of *zero* tokens — no input (prompt), no cached input, and no
+ * output — never actually reached the model. The provider rejected the request
+ * upstream (billing 4xx / plan exhaustion / quota), so the run did no work.
+ *
+ * During the DeepSeek 402 outage (COR-3518) these runs were recorded as
+ * "succeeded": the adapter surfaced no `errorMessage` and exited cleanly, so
+ * the outcome fell into the success branch, no failure disposition was
+ * produced, and the runtime parked 32 issues silently for ~3 days. The same
+ * signature reproduces on any balance/plan-billed provider (zai 429, xai 403,
+ * minimax 402). Classifying it as a failure makes a disposition + failure
+ * alert (`reportRunFailure`) fire on the first occurrence instead of the next
+ * manual sweep.
+ *
+ * Deliberately gated on the adapter having *reported* usage: adapters that do
+ * not emit token usage at all (e.g. http / openclaw_gateway) pass
+ * `usage: undefined` and are never mis-flagged. Empirically clean — across
+ * 3,446 succeeded runs / 30 days, no legitimate succeeded run reported
+ * input>0 with output==0, and every both-zero succeeded run was a
+ * balance-billed provider death. Requiring input AND output to be zero (not
+ * output alone) also sidesteps the legitimate-empty-completion class the issue
+ * warns about: a genuine empty completion still bills the prompt (input>0).
+ */
+export function isZeroTokenProviderFailure(
+  result: Pick<AdapterExecutionResult, "usage">,
+): boolean {
+  const usage = result.usage;
+  if (!usage) return false;
+  const input = asNumber(usage.inputTokens, Number.NaN);
+  const cached = asNumber(usage.cachedInputTokens, 0);
+  const output = asNumber(usage.outputTokens, Number.NaN);
+  if (
+    !Number.isFinite(input) ||
+    !Number.isFinite(output) ||
+    !Number.isFinite(cached)
+  ) {
+    return false;
+  }
+  return input <= 0 && cached <= 0 && output <= 0;
+}
+
 function normalizeBilledCostCents(
   costUsd: number | null | undefined,
   billingType: BillingType,
@@ -24737,7 +24784,23 @@ export function heartbeatService(
           !adapterResult.signal &&
           !processCancellation?.failed
         ) {
-          outcome = "succeeded";
+          if (isZeroTokenProviderFailure(adapterResult)) {
+            // COR-3538: clean exit, but the adapter reported zero tokens billed
+            // (no input/cached/output) — the request never reached the model, a
+            // silent provider/billing rejection. Fail the run (and label it) so
+            // a disposition + failure alert fire on first occurrence instead of
+            // being parked as "successful" (DeepSeek 402 outage, COR-3518).
+            outcome = "failed";
+            if (!adapterResult.errorCode) {
+              adapterResult.errorCode = ZERO_TOKEN_PROVIDER_FAILURE_ERROR_CODE;
+            }
+            if (!adapterResult.errorMessage) {
+              adapterResult.errorMessage =
+                ZERO_TOKEN_PROVIDER_FAILURE_ERROR_MESSAGE;
+            }
+          } else {
+            outcome = "succeeded";
+          }
         } else {
           outcome = "failed";
         }

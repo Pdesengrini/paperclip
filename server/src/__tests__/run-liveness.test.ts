@@ -258,4 +258,73 @@ describe("run liveness classifier", () => {
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
   });
+
+  // COR-3756: the silent kimi-code/k3 empty-end_turn signature. The adapter emits
+  // no assistant narrative, so buildAcpxRunSummary falls back to the bare stop
+  // reason ("end_turn") and the only run artifacts are infra telemetry (which no
+  // longer counts as concrete evidence). Before the fix this classified `advanced`
+  // / `needs_followup` and the run was recorded succeeded — a silent no-op.
+  it("classifies an empty end_turn no-op as empty_response despite the fallback summary", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        status: "completed",
+        stopReason: "completed",
+        summary: "end_turn",
+        assistantOutputChars: 0,
+      },
+      stdoutExcerpt: "[paperclip] No project or prior session workspace was available. Using fallback workspace.",
+      evidence: null,
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+    expect(classification.lastUsefulActionAt).toBeNull();
+  });
+
+  it("does not flag a tool-only turn (comment posted, no narrative) as an empty no-op", () => {
+    const latestEvidenceAt = new Date("2026-10-03T13:34:57Z");
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        status: "completed",
+        summary: "end_turn",
+        assistantOutputChars: 0,
+      },
+      evidence: {
+        issueCommentsCreated: 1,
+        latestEvidenceAt,
+      },
+    });
+
+    expect(classification.livenessState).toBe("advanced");
+    expect(classification.lastUsefulActionAt).toBe(latestEvidenceAt);
+  });
+
+  it("does not flag a narrative-only taskless sweep (no concrete evidence) as an empty no-op", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        status: "completed",
+        summary: "Timer wake, no assignment — running the red-agent sweep.",
+        assistantOutputChars: 54,
+      },
+      evidence: null,
+    });
+
+    expect(classification.livenessState).not.toBe("empty_response");
+  });
+
+  it("leaves adapters that do not report assistantOutputChars on their prior path", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "Updated implementation and verified the change.",
+      },
+      evidence: null,
+    });
+
+    // No assistantOutputChars field => reportedEmptyAssistantTurn is false, so the
+    // useful-output heuristic still governs (needs_followup here, not empty_response).
+    expect(classification.livenessState).toBe("needs_followup");
+  });
 });

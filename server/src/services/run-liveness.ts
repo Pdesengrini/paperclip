@@ -165,6 +165,20 @@ export function hasUsefulOutput(input: RunLivenessClassificationInput) {
   return combinedOutput(input).length > 0;
 }
 
+// COR-3756: a clean turn whose adapter reported zero assistant narrative is the
+// silent empty-end_turn signature (kimi-code/k3). `assistantOutputChars` is set by
+// the acpx engine from the real output segments, so it is not fooled by the
+// fallback `summary` (which leaks the bare stop reason, e.g. "end_turn", as if it
+// were content). The field is only present on acpx runs; when it is absent we
+// return false so non-acpx adapters and historical runs keep their prior behavior.
+export function reportedEmptyAssistantTurn(
+  resultJson: Record<string, unknown> | null | undefined,
+) {
+  if (!resultJson) return false;
+  const chars = resultJson.assistantOutputChars;
+  return typeof chars === "number" && Number.isFinite(chars) && chars <= 0;
+}
+
 export function declaredBlocker(input: RunLivenessClassificationInput) {
   if (input.issue?.status === "blocked") return true;
   const actionability = classifyRunActionability(input);
@@ -340,6 +354,16 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (declaredBlocker(input)) {
     return output("blocked", issueStatus === "blocked" ? "Issue status is blocked" : "Run output declared a concrete blocker", nextAction);
+  }
+
+  // COR-3756: an empty no-op turn — the adapter produced no assistant narrative and
+  // the run left no concrete work evidence. This must classify as empty_response even
+  // though the fallback `summary` leaks the bare stop reason into the useful-output
+  // heuristic (which would otherwise mis-label it needs_followup/advanced). Declared
+  // blockers are handled above, so reaching here with no output and no evidence is the
+  // silent-failure signature the fleet had no way to detect.
+  if (reportedEmptyAssistantTurn(input.resultJson) && !concreteEvidence) {
+    return output("empty_response", "Run succeeded with an empty turn: adapter produced no assistant output and the run left no concrete action evidence");
   }
 
   if (!usefulOutput && !concreteEvidence) {

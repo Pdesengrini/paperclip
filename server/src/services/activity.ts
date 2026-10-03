@@ -265,18 +265,30 @@ export function activityService(db: Db) {
         .from(workspaceOperations)
         .where(and(eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.heartbeatRunId, run.id)));
 
+      // COR-3756: environment lease acquire/release, named-gateway discovery and
+      // webhook processing are per-run infrastructure the runner writes on every
+      // run, not agent work. Counting them as concrete action evidence let a silent
+      // empty-end_turn no-op (which still acquires/releases a lease) masquerade as a
+      // run that did work. Exclude that infrastructure so only genuine activity
+      // (issue comments/updates, document and work-product writes, etc.) counts.
       const [activityStats] = await db
         .select({
-          count: sql<number>`count(*)::int`,
-          latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
+          count: sql<number>`count(*) filter (where ${activityLog.action} not in ('environment.lease_acquired', 'environment.lease_released', 'tool_gateway.discovery', 'tool_connection.webhook_processed'))::int`,
+          latestAt: sql<Date | null>`max(${activityLog.createdAt}) filter (where ${activityLog.action} not in ('environment.lease_acquired', 'environment.lease_released', 'tool_gateway.discovery', 'tool_connection.webhook_processed'))`,
         })
         .from(activityLog)
         .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id)));
 
+      // COR-3756: `run.*` events (run.phase.timing, run.startup.step,
+      // run.presentation.resolved) are runner telemetry emitted on every run, not
+      // agent work. Counting them as concrete action evidence made every succeeded
+      // run classify `advanced`, which is why a silent empty-end_turn no-op was
+      // indistinguishable from a run that did real work. Exclude the telemetry
+      // namespace alongside the existing lifecycle/adapter.invoke/error events.
       const [eventStats] = await db
         .select({
-          count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int`,
-          latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))`,
+          count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error') and ${heartbeatRunEvents.eventType} not like 'run.%')::int`,
+          latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error') and ${heartbeatRunEvents.eventType} not like 'run.%')`,
         })
         .from(heartbeatRunEvents)
         .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id)));

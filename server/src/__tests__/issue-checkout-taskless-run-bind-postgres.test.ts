@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -156,13 +156,19 @@ describeEmbeddedPostgres(
       const runId = await seedTasklessRun(companyId, agentId);
       const client = app(agentActor(companyId, agentId, runId));
 
-      // Before checkout there is no source issue/task on the run: even a write to
-      // the issue the run is assigned fails closed with the run-context denial.
+      // Before checkout there is no source issue/task on the run: a write to the
+      // issue is allowed but metered against the cross-issue cap (unscoped runs
+      // spend the cap rather than being rejected as run-less).
       const before = await request(client)
         .post(`/api/issues/${issueId}/comments`)
         .send({ body: "before checkout" });
-      expect(before.status, JSON.stringify(before.body)).toBe(403);
-      expect(before.body.details?.code).toBe("cross_issue_influence_run_context_required");
+      expect(before.status, JSON.stringify(before.body)).toBe(201);
+
+      const preBindInfluence = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.cross_issue_influence_observed")));
+      expect(preBindInfluence).toHaveLength(1);
 
       // Checkout anchors the run to the claimed issue.
       const checkout = await request(client)
@@ -176,11 +182,18 @@ describeEmbeddedPostgres(
         .where(eq(heartbeatRuns.id, runId));
       expect(run.contextSnapshot).toMatchObject({ issueId, source: "timer" });
 
-      // Same-issue comment now passes without a gate throw.
+      // Same-issue comment now passes unmetered — the bind anchors the run, so
+      // no further cross-issue influence rows are recorded for it.
       const comment = await request(client)
         .post(`/api/issues/${issueId}/comments`)
         .send({ body: "disposition: taskless run can write to its issue" });
       expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+
+      const postBindInfluence = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.cross_issue_influence_observed")));
+      expect(postBindInfluence).toHaveLength(1);
 
       // Same-issue status change (a real disposition) now passes too. A correct
       // disposition on the recovered issue is exactly what breaks the

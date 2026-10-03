@@ -1,6 +1,6 @@
 import { and, count, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -115,6 +115,30 @@ export async function observeCrossIssueInfluence(
     // rejecting these writes as run-less left live heartbeat runs unable to
     // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId && isUuidLike(input.targetIssueId)) {
+      // Durable self-issue fallback. `context_snapshot.issueId` is written
+      // best-effort by `bindRunContextToCheckedOutIssue` on checkout, but the
+      // heartbeat lifecycle persists the run's full in-memory snapshot back
+      // mid-run and can erase the anchor. This branch only runs when the snapshot
+      // has no source, so `issues.checkoutRunId`/`executionRunId` — written by
+      // checkout/run-start and never touched by snapshot writes — are the
+      // authoritative signal that this run owns the target issue. Allowing a run
+      // to write to the issue it holds the lock on does not widen the cross-issue
+      // budget: it is the same allowance as `sourceIssueId === target`.
+      const targetLock = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, input.targetIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (
+        targetLock &&
+        (targetLock.checkoutRunId === input.runId || targetLock.executionRunId === input.runId)
+      ) {
+        return null;
+      }
+      // No snapshot source and no lock held: fall through — the unscoped run's
+      // writes are metered against the cross-issue cap like any other.
+    }
     if (
       sourceIssueId !== null &&
       (sourceIssueId === input.targetIssueId ||

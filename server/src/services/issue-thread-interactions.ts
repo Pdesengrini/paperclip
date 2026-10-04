@@ -73,7 +73,6 @@ import type {
 } from "@paperclipai/shared";
 import {
   acceptIssueThreadInteractionSchema,
-  askUserQuestionsPayloadSchema,
   askUserQuestionsResultSchema,
   cancelIssueThreadInteractionSchema,
   connectionIntentPayloadSchema,
@@ -81,6 +80,7 @@ import {
   createIssueThreadInteractionSchema,
   legacyIssueThreadInteractionResolverPolicyAlias,
   normalizeIssueThreadInteractionResolverPolicy,
+  storedAskUserQuestionsPayloadSchema,
   rejectIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
@@ -698,7 +698,7 @@ function hydrateInteraction(
       return {
         ...base,
         kind: "ask_user_questions",
-        payload: askUserQuestionsPayloadSchema.parse(row.payload),
+        payload: storedAskUserQuestionsPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
           askUserQuestionsResultSchema,
           row.result,
@@ -3039,20 +3039,35 @@ export function issueThreadInteractionService(
           .then((issueRows) => issueRows[0]),
       ]);
 
-      const interactions = rows.map((row) =>
-        hydrateInteraction(
+      const interactions: IssueThreadInteraction[] = [];
+      for (const row of rows) {
+        const candidate =
           issue &&
-            isTerminalIssueStatus(issue.status) &&
-            row.status === "pending"
+          isTerminalIssueStatus(issue.status) &&
+          row.status === "pending"
             ? {
                 ...row,
                 status: "expired",
                 result: buildAdministrativeOutcomeResult(row, "issue_closed"),
                 resolvedAt: row.updatedAt,
               }
-            : row,
-        ),
-      );
+            : row;
+        try {
+          interactions.push(hydrateInteraction(candidate));
+        } catch (error) {
+          // A single stale row must not make the whole issue's interaction
+          // list — and therefore every status PATCH that reads it — fail.
+          // Terminal rows (resolved/withdrawn/cancelled, or any row on a
+          // closed issue) can never be acted on again, so drop them with a
+          // warning. Active pending rows still throw so a genuine write-path
+          // bug stays loud instead of silently disappearing from the board.
+          if (candidate.status === "pending") throw error;
+          console.warn(
+            `[paperclip] Dropping unparseable ${row.kind} interaction payload for interaction ${row.id}`,
+            error,
+          );
+        }
+      }
       return withAcceptanceReadiness(interactions, issue);
     },
 

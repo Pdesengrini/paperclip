@@ -3654,6 +3654,85 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(listed[0]?.status).toBe("cancelled");
   });
 
+  it("repairs a historical partial canonical question set on read (COR-3840)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Historical partial question set");
+
+    // Simulate a row persisted by an older build: the choices live on the
+    // legacy `questions[]` storage contract, but the canonical
+    // `questionSet.questions[].options` is empty. A hard parse rejected the row
+    // forever, which made the whole issue interaction list (and every status
+    // PATCH that reads it) fail.
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "cancelled",
+      continuationPolicy: { kind: "none" },
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "flow1",
+            prompt: "Flow 1?",
+            required: true,
+            selectionMode: "single",
+            options: [
+              { id: "pass", label: "Pass" },
+              { id: "fail", label: "Fail" },
+            ],
+          },
+        ],
+        questionSet: {
+          schema: "paperclip.question_set.v1",
+          questions: [
+            { id: "flow1", prompt: "Flow 1?", required: true, answerMode: "single_select" },
+          ],
+        },
+      },
+      createdByUserId: "local-board",
+    });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(1);
+    const payload = listed[0]?.payload as {
+      questionSet: { questions: Array<{ options?: unknown[] }> };
+    };
+    expect(payload.questionSet.questions[0]?.options).toHaveLength(2);
+  });
+
+  it("drops an unrepairable terminal row but still throws for a live pending row", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Unparseable payloads");
+    const kanonical = (status: "cancelled" | "pending") => ({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions" as const,
+      status,
+      continuationPolicy: { kind: "none" },
+      payload: {
+        version: 1,
+        questions: [
+          { id: "orphan", prompt: "Orphan?", required: true, selectionMode: "single", options: [{ id: "a", label: "A" }] },
+        ],
+        questionSet: {
+          schema: "paperclip.question_set.v1",
+          questions: [
+            { id: "ghost", prompt: "Ghost?", required: true, answerMode: "single_select" },
+          ],
+        },
+      },
+      createdByUserId: "local-board",
+    });
+
+    await db.insert(issueThreadInteractions).values(kanonical("cancelled"));
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(0);
+
+    await db.insert(issueThreadInteractions).values(kanonical("pending"));
+    await expect(interactionsSvc.listForIssue(issueId)).rejects.toThrow();
+  });
+
   it("derives legacy pending interactions as expired on closed issues without mutating the GET", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Legacy pending interaction on closed issue");
     const created = await interactionsSvc.create({ id: issueId, companyId }, {

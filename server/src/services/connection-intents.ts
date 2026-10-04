@@ -22,13 +22,14 @@ import {
   APP_STORE_DEFINITIONS,
   AGGREGATOR_PRIORITY, AGGREGATOR_NAMES, AGGREGATOR_CATALOG_SOURCES,
   findAggregatorService, searchAggregatorServices, prepareConnectionSearch, scoreConnectionSearch, explicitAggregatorQuery, normalizeConnectionQuery, parseAggregatorRoute, aggregatorProviderQuestion,
-  aggregatorContinuationInstruction, isRemoteMcpConnectorId, askUserQuestionsPayloadSchema, askUserQuestionsResultSchema,
+  aggregatorContinuationInstruction, isRemoteMcpConnectorId, askUserQuestionsResultSchema,
   CONNECTABLE_APP_DEFINITIONS,
   connectionIntentPayloadSchema,
   getAvailableConnectionMethods,
   isToolConnectionAttentionHealth,
   type ConnectionSearchResultItem,
   type AggregatorServiceDefinition,
+  storedAskUserQuestionsPayloadSchema,
   getAppStoreDefinition,
   type ConnectionIntentInteraction,
   type ConnectionIntentSetupOptions,
@@ -591,7 +592,7 @@ export function connectionIntentService(db: Db) {
     )).orderBy(desc(issueThreadInteractions.createdAt));
     return rows.filter(row => (!row.addresseeUserId || row.addresseeUserId === userId)
       && (!row.resolvedByUserId || row.resolvedByUserId === userId)
-      && askUserQuestionsPayloadSchema.safeParse(row.payload).success
+      && storedAskUserQuestionsPayloadSchema.safeParse(row.payload).success
       && (row.payload as { questions: Array<{ id: string }> }).questions.some(question => question.id === questionId));
   }
 
@@ -616,7 +617,7 @@ export function connectionIntentService(db: Db) {
 
   function selectedProvider(row: typeof issueThreadInteractions.$inferSelect, expected: ReturnType<typeof aggregatorProviderQuestion>) {
     if (row.status !== "answered" || !row.resolvedByUserId || row.resolvedByAgentId) return null;
-    const payload = askUserQuestionsPayloadSchema.safeParse(row.payload);
+    const payload = storedAskUserQuestionsPayloadSchema.safeParse(row.payload);
     const result = askUserQuestionsResultSchema.safeParse(row.result);
     if (!payload.success || !result.success) return null;
     const question = payload.data.questions.find(q => q.id === expected.id);

@@ -11,6 +11,8 @@ import {
   suggestedTaskDraftSchema,
   updateIssueSchema,
   upsertIssueDocumentSchema,
+  askUserQuestionsPayloadSchema,
+  storedAskUserQuestionsPayloadSchema,
 } from "./issue.js";
 import { createAgentSchema } from "./agent.js";
 
@@ -630,5 +632,97 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it("repairs a historical partial canonical questionSet on read", () => {
+    // Reproduces COR-3840: an older build wrote the choices on the legacy
+    // `questions[]` storage contract but left the canonical
+    // `questionSet.questions[].options` empty. Strict read validation rejected
+    // the row forever, which made the whole issue interaction list (and every
+    // status PATCH that reads it) fail.
+    const historical = {
+      version: 1 as const,
+      supersedeOnUserComment: true,
+      questions: [
+        {
+          id: "flow1",
+          prompt: "Flow 1?",
+          required: true,
+          selectionMode: "single" as const,
+          options: [
+            { id: "pass", label: "Pass", description: "Worked" },
+            { id: "fail", label: "Fail" },
+          ],
+        },
+        {
+          id: "notes",
+          prompt: "Notes?",
+          required: true,
+          selectionMode: "single" as const,
+          options: [{ id: "describe", label: "I'll describe it", freeText: true as const }],
+        },
+        {
+          id: "notes2",
+          prompt: "Notes two?",
+          required: false,
+          selectionMode: "single" as const,
+          options: [
+            { id: "pass", label: "Pass" },
+            { id: "describe", label: "Other", freeText: true as const },
+          ],
+        },
+      ],
+      questionSet: {
+        schema: "paperclip.question_set.v1" as const,
+        questions: [
+          { id: "flow1", prompt: "Flow 1?", required: true, answerMode: "single_select" as const },
+          { id: "notes", prompt: "Notes?", required: true, answerMode: "text" as const },
+          { id: "notes2", prompt: "Notes two?", required: false, answerMode: "single_select" as const },
+        ],
+      },
+    };
+
+    // The raw read schema rejects the partial canonical form.
+    expect(askUserQuestionsPayloadSchema.safeParse(historical).success).toBe(false);
+
+    const repaired = storedAskUserQuestionsPayloadSchema.parse(historical);
+    const canonical = repaired.questionSet!.questions;
+    expect(canonical[0].options).toEqual([
+      { id: "pass", label: "Pass", description: "Worked" },
+      { id: "fail", label: "Fail" },
+    ]);
+    // A text canonical question keeps no options even when storage has a free-text sentinel.
+    expect(canonical[1].options).toBeUndefined();
+    // A select canonical question with a storage free-text sentinel gains customAnswer.
+    expect(canonical[2].options).toEqual([{ id: "pass", label: "Pass" }]);
+    expect(canonical[2].customAnswer).toEqual({ enabled: true, label: "Other" });
+
+    // The repair is idempotent.
+    expect(
+      storedAskUserQuestionsPayloadSchema.parse(repaired),
+    ).toEqual(repaired);
+  });
+
+  it("does not repair a genuinely malformed select questionSet", () => {
+    const malformed = {
+      version: 1 as const,
+      questions: [
+        {
+          id: "flow1",
+          prompt: "Flow 1?",
+          required: true,
+          selectionMode: "single" as const,
+          options: [{ id: "pass", label: "Pass" }],
+        },
+      ],
+      questionSet: {
+        schema: "paperclip.question_set.v1" as const,
+        questions: [
+          { id: "flow1", prompt: "Flow 1?", required: true, answerMode: "single_select" as const },
+          { id: "ghost", prompt: "Ghost?", required: true, answerMode: "single_select" as const },
+        ],
+      },
+    };
+    expect(storedAskUserQuestionsPayloadSchema.safeParse(malformed).success).toBe(false);
   });
 });

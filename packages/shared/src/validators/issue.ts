@@ -41,7 +41,7 @@ import {
   trustAuthorizationPolicySchema,
 } from "./trust-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
-import { questionSetToAskUserQuestionsPayload } from "../question-set.js";
+import { questionSetToAskUserQuestionsPayload, repairStoredAskUserQuestionsPayload } from "../question-set.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -1438,6 +1438,20 @@ export const askUserQuestionsPayloadSchema = z
       }
     }
   });
+
+/**
+ * Read-time view of a persisted `ask_user_questions` payload. Historical rows
+ * written by older builds can carry an incomplete canonical `questionSet` even
+ * though the legacy `questions[]` storage contract is complete; repair that
+ * drift before strict validation so one stale row cannot make an issue's whole
+ * interaction list (and every status PATCH that reads it) fail. Creation stays
+ * strict: `createAskUserQuestionsPayloadSchema` validates the dual
+ * representations as written, so genuine write-path bugs still surface.
+ */
+export const storedAskUserQuestionsPayloadSchema = z.preprocess(
+  repairStoredAskUserQuestionsPayload,
+  askUserQuestionsPayloadSchema,
+);
 
 export const askUserQuestionsAnswerSchema = z.object({
   questionId: z.string().trim().min(1).max(160),

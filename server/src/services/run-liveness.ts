@@ -26,6 +26,34 @@ export interface RunLivenessEvidenceInput {
   latestEvidenceAt: Date | null;
 }
 
+// COR-3756: concrete-action evidence must count only genuine agent work. Both the
+// live run-completion path (heartbeat.ts `buildRunLivenessInput`) and the backfill
+// path (activity.ts `backfillMissingRunLivenessForIssue`) classify liveness, and
+// they previously drifted: each had its own hand-written exclusion list, so the
+// backfill fix for silent empty-end_turn no-ops did not cover the live path. These
+// shared constants are the single source of truth for what counts as per-run
+// infrastructure (not work), so the two evidence queries cannot diverge again.
+
+// activity_log actions the runner writes on every run (lease acquire/release,
+// tool-gateway discovery, inbound webhook processing) — a silent empty turn still
+// acquires/releases a lease, so counting these masked the no-op as real work.
+export const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS: string[] = [
+  "environment.lease_acquired",
+  "environment.lease_released",
+  "tool_gateway.discovery",
+  "tool_connection.webhook_processed",
+];
+
+// heartbeat_run_events types that are runner telemetry, not agent work. The exact
+// types below plus the entire `run.*` namespace (run.phase.timing, run.startup.step,
+// run.presentation.resolved) are emitted on every run, including empty no-ops.
+export const LIVENESS_BOOKKEEPING_EVENT_TYPES: string[] = [
+  "lifecycle",
+  "adapter.invoke",
+  "error",
+];
+export const LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX = "run.";
+
 export interface RunLivenessClassificationInput {
   runStatus: HeartbeatRunStatus | string;
   issue: RunLivenessIssueInput | null;

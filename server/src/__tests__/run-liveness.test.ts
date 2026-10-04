@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { classifyRunLiveness } from "../services/run-liveness.ts";
+import {
+  classifyRunLiveness,
+  LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS,
+  LIVENESS_BOOKKEEPING_EVENT_TYPES,
+  LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX,
+} from "../services/run-liveness.ts";
 
 const baseInput = {
   runStatus: "succeeded",
@@ -326,5 +331,30 @@ describe("run liveness classifier", () => {
     // No assistantOutputChars field => reportedEmptyAssistantTurn is false, so the
     // useful-output heuristic still governs (needs_followup here, not empty_response).
     expect(classification.livenessState).toBe("needs_followup");
+  });
+
+  // COR-3756 (Greptile review of PR #15097): the empty-turn detector only works if
+  // BOTH evidence queries exclude per-run infra. The live completion path
+  // (heartbeat.ts buildRunLivenessInput) and the backfill path (activity.ts) now
+  // derive their exclusions from these shared constants instead of hand-written
+  // lists that had drifted. Pin the invariants so a future edit cannot silently
+  // drop an exclusion and let the no-op signature count as concrete work again.
+  it("keeps the shared liveness-bookkeeping exclusions that both evidence queries depend on", () => {
+    // run.* telemetry (run.phase.timing/run.startup.step/run.presentation.resolved)
+    // is emitted on every run including empty no-ops and must never count as work.
+    expect(LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX).toBe("run.");
+    for (const required of ["lifecycle", "adapter.invoke", "error"]) {
+      expect(LIVENESS_BOOKKEEPING_EVENT_TYPES).toContain(required);
+    }
+    // Infra activity the runner writes even on a silent empty turn (lease churn,
+    // gateway discovery, inbound webhook processing).
+    for (const required of [
+      "environment.lease_acquired",
+      "environment.lease_released",
+      "tool_gateway.discovery",
+      "tool_connection.webhook_processed",
+    ]) {
+      expect(LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS).toContain(required);
+    }
   });
 });

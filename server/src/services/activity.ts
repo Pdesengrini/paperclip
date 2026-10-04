@@ -1,5 +1,5 @@
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -19,7 +19,12 @@ import {
 import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { classifyRunLiveness } from "./run-liveness.js";
+import {
+  classifyRunLiveness,
+  LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS,
+  LIVENESS_BOOKKEEPING_EVENT_TYPES,
+  LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX,
+} from "./run-liveness.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -269,26 +274,33 @@ export function activityService(db: Db) {
       // webhook processing are per-run infrastructure the runner writes on every
       // run, not agent work. Counting them as concrete action evidence let a silent
       // empty-end_turn no-op (which still acquires/releases a lease) masquerade as a
-      // run that did work. Exclude that infrastructure so only genuine activity
-      // (issue comments/updates, document and work-product writes, etc.) counts.
+      // run that did work. The exclusion list is shared with the live completion
+      // path (heartbeat.ts) via LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS so the two
+      // queries cannot drift (the original fix touched only this backfill path).
       const [activityStats] = await db
         .select({
-          count: sql<number>`count(*) filter (where ${activityLog.action} not in ('environment.lease_acquired', 'environment.lease_released', 'tool_gateway.discovery', 'tool_connection.webhook_processed'))::int`,
-          latestAt: sql<Date | null>`max(${activityLog.createdAt}) filter (where ${activityLog.action} not in ('environment.lease_acquired', 'environment.lease_released', 'tool_gateway.discovery', 'tool_connection.webhook_processed'))`,
+          count: sql<number>`count(*)::int`,
+          latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
         })
         .from(activityLog)
-        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id)));
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.runId, run.id),
+            notInArray(activityLog.action, LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS),
+          ),
+        );
 
       // COR-3756: `run.*` events (run.phase.timing, run.startup.step,
       // run.presentation.resolved) are runner telemetry emitted on every run, not
       // agent work. Counting them as concrete action evidence made every succeeded
       // run classify `advanced`, which is why a silent empty-end_turn no-op was
-      // indistinguishable from a run that did real work. Exclude the telemetry
-      // namespace alongside the existing lifecycle/adapter.invoke/error events.
+      // indistinguishable from a run that did real work. Exclusions are shared with
+      // the live path via the LIVENESS_BOOKKEEPING_* constants.
       const [eventStats] = await db
         .select({
-          count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error') and ${heartbeatRunEvents.eventType} not like 'run.%')::int`,
-          latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error') and ${heartbeatRunEvents.eventType} not like 'run.%')`,
+          count: sql<number>`count(*) filter (where ${notInArray(heartbeatRunEvents.eventType, LIVENESS_BOOKKEEPING_EVENT_TYPES)} and ${heartbeatRunEvents.eventType} not like ${`${LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX}%`})::int`,
+          latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${notInArray(heartbeatRunEvents.eventType, LIVENESS_BOOKKEEPING_EVENT_TYPES)} and ${heartbeatRunEvents.eventType} not like ${`${LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX}%`})`,
         })
         .from(heartbeatRunEvents)
         .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id)));

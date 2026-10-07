@@ -2103,17 +2103,29 @@ impl CodexCommandExecutor {
                                 "providerTurnId": previous_active_turn_id,
                                 "status": "failed",
                                 "providerTerminalObserved": false,
+                                "error": if provider_label == "codex" { json!({
+                                    "code": "provider_turn_lost_on_restore",
+                                    "recoverable": true,
+                                    "message": "The runner restored the conversation after process loss, but the previous turn is no longer active.",
+                                }) } else { Value::Null },
                             }),
                         };
-                        let outcome = terminal_events(
-                            state,
-                            "turn.failed",
-                            state.goal.as_ref().map(|goal| goal.status.as_str()),
-                        );
-                        state.extend_terminal_events(with_terminal_outcome(
-                            vec![provider_terminal],
-                            outcome,
-                        ))?;
+                        if provider_label == "codex" {
+                            // No provider result was observed. Preserve the lost
+                            // turn as a fact, but leave the run open for the
+                            // controller's bounded same-conversation recovery.
+                            state.push_terminal_event(provider_terminal)?;
+                        } else {
+                            let outcome = terminal_events(
+                                state,
+                                "turn.failed",
+                                state.goal.as_ref().map(|goal| goal.status.as_str()),
+                            );
+                            state.extend_terminal_events(with_terminal_outcome(
+                                vec![provider_terminal],
+                                outcome,
+                            ))?;
+                        }
                     }
                 } else {
                     state.push_event(reconciled)?;
@@ -4904,6 +4916,18 @@ mod tests {
         assert!(block_message.len() <= 512);
         assert!(!block_message.chars().any(char::is_control));
 
+        let question_result = schema_rejection(
+            "request_human_input",
+            json!({"PRIVATE_FIELD": "PRIVATE_VALUE"}),
+        );
+        let question_message = question_result.result["error"]["message"].as_str().unwrap();
+        assert!(question_message.contains("payload.questionSet"));
+        assert!(question_message.contains("/required (missing \"requiredField\")"));
+        assert!(!question_message.contains("PRIVATE_FIELD"));
+        assert!(!question_result.result.to_string().contains("PRIVATE_VALUE"));
+        assert!(question_message.len() <= 512);
+        assert_eq!(question_result.result["error"]["retryable"], false);
+
         let ordinary_result = schema_rejection("get_task_context", json!({}));
         assert_eq!(
             ordinary_result.result["error"]["message"],
@@ -4933,7 +4957,7 @@ mod tests {
             CodexProviderConfig {
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
-                provider_version: "1.18.32".to_owned(),
+                provider_version: "1.18.34".to_owned(),
                 command: PathBuf::from("node"),
                 args: Vec::new(),
                 cwd: std::env::current_dir()
@@ -5295,7 +5319,7 @@ mod tests {
             CodexProviderConfig {
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
-                provider_version: "1.18.32".to_owned(),
+                provider_version: "1.18.34".to_owned(),
                 command: PathBuf::from("node"),
                 args: Vec::new(),
                 cwd: std::env::current_dir()

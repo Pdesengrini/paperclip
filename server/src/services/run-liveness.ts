@@ -1,4 +1,4 @@
-import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
+import { isAiAuthenticationRepairable } from "./ai-auth-failure.js";
 import type { HeartbeatRunStatus, IssueStatus, RunLivenessState } from "@paperclipai/shared";
 
 export type RunLivenessActionability =
@@ -42,6 +42,10 @@ export const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS: string[] = [
   "environment.lease_released",
   "tool_gateway.discovery",
   "tool_connection.webhook_processed",
+  // Folded in from upstream master during the COR-3756 rebase: automatic cost
+  // reporting is bookkeeping, not genuine agent work, so it must not mask a
+  // silent empty no-op turn either.
+  "cost.reported",
 ];
 
 // heartbeat_run_events types that are runner telemetry, not agent work. The exact
@@ -365,7 +369,7 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     return output("needs_followup", input.errorCode ? `Run interrupted (${input.errorCode})` : "Run interrupted");
   }
 
-  if (input.runStatus === "failed" && input.authenticationRepairRequested && isAiAuthenticationFailure(input.errorCode)) {
+  if (input.runStatus === "failed" && input.authenticationRepairRequested && isAiAuthenticationRepairable(input)) {
     return output("blocked", "Waiting for provider authentication repair", "Complete the connection request to continue this task");
   }
 

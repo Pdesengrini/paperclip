@@ -175,7 +175,7 @@ function makeIssue() {
   };
 }
 
-describe.sequential("issue checkout binds the run context to the checked-out issue", () => {
+describe("issue checkout binds the run context to the checked-out issue", () => {
   const routeModules = hoistModuleGraph(registerServiceMocks, async () => {
     const [{ issueRoutes }, { errorHandler }] = await Promise.all([
       vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),

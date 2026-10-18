@@ -77,8 +77,33 @@ function normalizeKeyPrefix(prefix: string | undefined): string {
   return prefix.trim().replace(/^\/+/, "").replace(/\/+$/, "");
 }
 
+// 200 MiB per run keeps the live tail useful while bounding disk growth. A
+// single verbose run has been observed at >1 GiB, so the default matters.
+export const DEFAULT_RUN_LOG_MAX_BYTES = 200 * 1024 * 1024;
+
+// Invalid values fall back to the default rather than silently disabling the
+// cap: an operator who mistypes RUN_LOG_MAX_BYTES should not get unbounded
+// logs. 0 is the explicit opt-out.
+function resolveRunLogMaxBytes(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RUN_LOG_MAX_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(
+      `[run-log-store] Ignoring invalid RUN_LOG_MAX_BYTES=${JSON.stringify(raw)}; using ${DEFAULT_RUN_LOG_MAX_BYTES}`,
+    );
+    return DEFAULT_RUN_LOG_MAX_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
 export interface DurableRunLogStoreOptions {
   basePath: string;
+  // Hard per-run cap in bytes (0 disables). When omitted, the store resolves
+  // RUN_LOG_MAX_BYTES (default 200 MiB). The cap bounds disk use on hosts that
+  // run long, chatty agent sessions; once a run log reaches it, further output
+  // is dropped from the file but the run keeps running (live tail still works
+  // up to the cap).
+  maxBytes?: number;
   // When provided, completed logs are mirrored to object storage on finalize and
   // served from there on read whenever the local file is missing (e.g. the pod
   // rolled and wiped the emptyDir). When omitted, the store is local-only (the
@@ -116,6 +141,16 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
   const s3 = options.s3;
   const s3Prefix = normalizeKeyPrefix(s3?.keyPrefix);
   const inflightMirrorMs = s3?.inflightMirrorMs && s3.inflightMirrorMs > 0 ? s3.inflightMirrorMs : 0;
+  const configuredMaxBytes =
+    options.maxBytes === undefined ? resolveRunLogMaxBytes(process.env.RUN_LOG_MAX_BYTES) : options.maxBytes;
+  const maxBytes = Number.isFinite(configuredMaxBytes) && configuredMaxBytes > 0 ? Math.floor(configuredMaxBytes) : 0;
+  // Bytes already in each run log, keyed by logRef (retries share a logRef).
+  // Appends reserve their bytes in this map BEFORE the async write, so
+  // concurrent appends cannot all observe the same free budget and overshoot
+  // the cap. A failed write only leaves the reservation too high, which can
+  // cap early but never exceed the cap.
+  const fileSizes = new Map<string, number>();
+  const capWarned = new Set<string>();
   // A run owns the write handle returned by begin(). Diagnostics can be
   // dispatched without awaiting the rest of onLog (DB progress/live events),
   // but finalize must include every file append already accepted on that handle.
@@ -338,6 +373,11 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       }
       const file = await fs.open(absPath, "a", 0o600);
       await file.close();
+      // Seed cap accounting from the actual file (a restored or existing
+      // prefix counts toward the cap). Stat after the open so a concurrent
+      // restore/retry is visible.
+      const existing = await fs.stat(absPath).catch(() => null);
+      fileSizes.set(relPath, existing?.size ?? 0);
       return { store: "local_file", logRef: relPath, attemptId: randomUUID() };
     },
 
@@ -355,12 +395,40 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
       });
       const persisted = `${line}\n`;
+      let payload: string | Buffer = persisted;
+      if (maxBytes > 0) {
+        let size = fileSizes.get(handle.logRef);
+        if (size === undefined) {
+          const stat = await fs.stat(absPath).catch(() => null);
+          size = stat?.size ?? 0;
+        }
+        const remaining = maxBytes - size;
+        if (remaining <= 0) {
+          if (!capWarned.has(handle.logRef)) {
+            capWarned.add(handle.logRef);
+            console.warn(
+              `[run-log-store] Run log ${handle.logRef} reached RUN_LOG_MAX_BYTES (${maxBytes}); further output is not persisted to the run log.`,
+            );
+          }
+          return 0;
+        }
+        const persistedBytes = Buffer.byteLength(persisted, "utf8");
+        if (persistedBytes > remaining) {
+          // Fill the remaining budget exactly. The final ndjson line is
+          // intentionally incomplete (a reader sees a partial trailing line);
+          // this only happens once, when the cap is first reached.
+          payload = Buffer.from(persisted, "utf8").subarray(0, remaining);
+          fileSizes.set(handle.logRef, maxBytes);
+        } else {
+          fileSizes.set(handle.logRef, size + persistedBytes);
+        }
+      }
       let pending = pendingAppends.get(handle);
       if (!pending) {
         pending = new Set();
         pendingAppends.set(handle, pending);
       }
-      const write = fs.appendFile(absPath, persisted, "utf8").then(() => {
+      const write = fs.appendFile(absPath, payload, "utf8").then(() => {
         if (!closingHandles.has(handle)) noteInflightAppend(handle.logRef);
       });
       pending.add(write);
@@ -369,7 +437,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       } finally {
         pending.delete(write);
       }
-      return Buffer.byteLength(persisted, "utf8");
+      return Buffer.byteLength(payload, "utf8");
     },
 
     async finalize(handle) {
@@ -392,6 +460,8 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         // mirror a file it may still change, and never re-arm mirroring when
         // that write eventually finishes. Terminal run status can still settle.
         abandonedHandles.add(handle);
+        fileSizes.delete(handle.logRef);
+        capWarned.delete(handle.logRef);
         void retireInflightMirror(handle.logRef).catch(() => undefined);
         console.warn("[run-log-store] Pending log writes did not settle within 3000ms; final log size and hash are unknown.");
         return { bytes: null, sha256: null, compressed: false };
@@ -400,6 +470,8 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       const absPath = resolveWithin(basePath, handle.logRef);
       const stat = await fs.stat(absPath).catch(() => null);
       if (!stat) throw notFound("Run log not found");
+      fileSizes.delete(handle.logRef);
+      capWarned.delete(handle.logRef);
       const hash = await sha256File(absPath);
 
       // Mirror the completed log to object storage so it survives a pod roll.
@@ -512,6 +584,9 @@ let cachedStore: RunLogStore | null = null;
 export function getRunLogStore() {
   if (cachedStore) return cachedStore;
   const basePath = process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  // RUN_LOG_MAX_BYTES is resolved inside createDurableRunLogStore (default
+  // 200 MiB, 0 disables) so every construction path gets the cap, not just
+  // this production singleton.
   cachedStore = createDurableRunLogStore({ basePath, s3: resolveRunLogS3() });
   return cachedStore;
 }

@@ -425,10 +425,16 @@ const support = await getEmbeddedPostgresTestSupport();
         .update(connectionGrants)
         .set({ providerTenant: null })
         .where(eq(connectionGrants.id, duplicate.id));
-      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
-        status: "unavailable",
-        env: {},
-      });
+      // COR-4217: a grant without provider account metadata can never yield a
+      // credential, so it no longer makes the healthy grant ambiguous.
+      expect(
+        (
+          await resolveManagedGitHubIdentitySelection(db, input.companyId, {
+            ...input,
+            responsibleUserId: "A",
+          })
+        ).grant?.id,
+      ).toBe(first.id);
       await db
         .update(toolConnectionInstalls)
         .set({ targetId: randomUUID() })

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, companyMemberships, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, companySkills, createDb, heartbeatRunEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
 import { withSkillVersionCacheLock } from "../services/skill-version-cache.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
@@ -49,10 +49,12 @@ vi.mock("../services/company-skills.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/company-skills.js")>();
   return { ...actual, companySkillService: (...args: Parameters<typeof actual.companySkillService>) => {
     const service = actual.companySkillService(...args);
-    return { ...service, listRuntimeSkillEntries: async (...input: Parameters<typeof service.listRuntimeSkillEntries>) => {
-      const failure = skillFailures.get(input[0]);
+    return { ...service, withRuntimeSkillEntries: async <T>(companyId: string,
+      options: Parameters<typeof service.withRuntimeSkillEntries>[1],
+      consume: (entries: Awaited<ReturnType<typeof service.listRuntimeSkillEntries>>) => T | Promise<T>) => {
+      const failure = skillFailures.get(companyId);
       if (failure) throw new Error(failure);
-      return service.listRuntimeSkillEntries(...input);
+      return service.withRuntimeSkillEntries(companyId, options, consume);
     } };
   } };
 });
@@ -103,6 +105,8 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), projectId = randomUUID();
     const userId = `configuration-user-${companyId}`;
     const credential = `fixture-api-key-${companyId}`;
+    await db.insert(authUsers).values({ id: userId, name: "Configuration user", email: `${userId}@example.test`,
+      createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Execution configuration fixture", issuePrefix: `C${companyId.slice(0, 6)}` });
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
     const account = managed ? await aiConnectionService(db).save(companyId, userId, {
@@ -185,7 +189,11 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }
     skillFailures.set(f.companyId, "Preconfigured mode must not resolve assigned skills");
     const prepare = vi.spyOn(aiRuntime, "prepareManagedAiRuntime");
-    const beforeNative = vi.fn(async () => { throw new Error("fixture stopped before provider start"); });
+    const beforeNative = vi.fn(async () => {
+      // The fixture intentionally stops preparation; do not schedule a retry.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      throw new Error("fixture stopped before provider start");
+    });
     const nativeHeartbeat = heartbeatService(db, { beforeNativeRuntimeSelection: beforeNative });
     try {
       const run = await nativeHeartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",

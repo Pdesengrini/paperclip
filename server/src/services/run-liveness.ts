@@ -55,6 +55,8 @@ export const LIVENESS_BOOKKEEPING_EVENT_TYPES: string[] = [
   "lifecycle",
   "adapter.invoke",
   "error",
+  "legacy.case_handoff_cleanup_intent",
+  "legacy.case_handoff_cleanup_verified",
 ];
 export const LIVENESS_BOOKKEEPING_EVENT_TYPE_PREFIX = "run.";
 

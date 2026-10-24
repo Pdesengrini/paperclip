@@ -627,7 +627,8 @@ export function createHeartbeatScheduling(
     }
 
     try {
-      if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
+      let wakeMonitorTarget = monitor?.serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME;
+      if (!wakeMonitorTarget) {
         // Normalized monitor projections redact externalRef. Read the claimed
         // persisted policy only on this server-owned quota recovery path.
         const sourceRunId = readNonEmptyString(
@@ -682,8 +683,13 @@ export function createHeartbeatScheduling(
           );
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
+          // Short transient retries can spend their whole budget inside the
+          // quota window. The quota wait has elapsed now, so start a fresh turn
+          // rather than recording a trigger that never runs anything.
+          wakeMonitorTarget = scheduled.outcome === "retry_exhausted";
         }
-      } else {
+      }
+      if (wakeMonitorTarget) {
         const wake = await enqueueWakeup(targetAgentId, {
           issueStateGuard: { statuses: [claimed.status], assigneeAgentId: claimed.assigneeAgentId,
             monitorNextCheckAt: scheduledAtIso, monitorWakeRequestedAt: claimed.monitorWakeRequestedAt!.toISOString() },

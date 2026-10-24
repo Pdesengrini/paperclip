@@ -954,6 +954,83 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
   });
 
+  async function seedExhaustedQuotaRun(companyId: string, agentId: string, issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "failed",
+      errorCode: "provider_quota",
+      error: "403 You've reached your 5-hour usage limit.",
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "transient_failure",
+      resultJson: { errorFamily: "provider_quota", conversationContinuation: "continue_conversation_v1" },
+      startedAt: new Date(Date.now() - 2 * 60_000),
+      finishedAt: new Date(Date.now() - 60_000),
+      contextSnapshot: { issueId },
+    });
+    return runId;
+  }
+
+  it("leaves a due provider-quota monitor to the scheduler instead of pushing it back", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = await seedExhaustedQuotaRun(companyId, coderId, sourceIssueId);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+    const [scheduled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(scheduled?.executionPolicy).toMatchObject({ monitor: { externalRef: runId } });
+
+    // The sweep can land a moment after the monitor comes due, before the
+    // scheduler tick has dispatched it.
+    const dueAt = new Date(Date.now() - 1_000);
+    await db.update(issues).set({ monitorNextCheckAt: dueAt }).where(eq(issues.id, sourceIssueId));
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    const [afterSweep] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(afterSweep?.monitorNextCheckAt?.toISOString()).toBe(dueAt.toISOString());
+  });
+
+  it("stops re-arming a provider-quota monitor on one source run after the wait bound", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = await seedExhaustedQuotaRun(companyId, coderId, sourceIssueId);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+    const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const startedAt = (firstRun?.resultJson as Record<string, unknown>)?.providerQuotaRecoveryStartedAt;
+    expect(typeof startedAt).toBe("string");
+
+    // A monitor that fired without producing a newer run leaves the same
+    // source run as latest. Re-arming keeps the first wait start.
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() - 60 * 60_000) })
+      .where(eq(issues.id, sourceIssueId));
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+    const [rearmedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect((rearmedRun?.resultJson as Record<string, unknown>)?.providerQuotaRecoveryStartedAt).toBe(startedAt);
+
+    // Once that wait has lasted a full day, hand off to the durable quota
+    // recovery path, which owns a real scheduled retry run.
+    await db.update(heartbeatRuns).set({
+      resultJson: sql`${heartbeatRuns.resultJson} || ${JSON.stringify({
+        providerQuotaRecoveryStartedAt: new Date(Date.now() - 25 * 60 * 60_000).toISOString(),
+      })}::jsonb`,
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() - 60 * 60_000) })
+      .where(eq(issues.id, sourceIssueId));
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, escalated: 1 });
+    const [escalated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(escalated).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    expect(await db.select().from(issueRecoveryActions)).toEqual([
+      expect.objectContaining({ cause: "provider_quota", ownerType: "system", returnOwnerAgentId: coderId }),
+    ]);
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "provider_quota_recovery" });
+  });
+
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, sourceIssueId));

@@ -388,6 +388,34 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(await db.select().from(issueRecoveryActions)).toMatchObject([{ ownerType: "board", evidence: { runId: sourceRunId } }]);
   });
 
+  it("starts a fresh run when the quota source already spent its transient retry budget", async () => {
+    const sourceRunId = randomUUID();
+    const { companyId, issueId, agentId } = await seedFixture({
+      monitor: { serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRunId },
+    });
+    // The short transient retries all hit the same quota window, so the source
+    // run is the last of its bounded chain. Its conversation-continuation
+    // policy means no action reconciliation is needed before a fresh turn.
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId, companyId, agentId, status: "failed", errorCode: "provider_quota",
+      finishedAt: new Date("2026-04-11T11:30:00.000Z"), contextSnapshot: { issueId },
+      scheduledRetryAttempt: 2, scheduledRetryReason: "transient_failure",
+      resultJson: { errorFamily: "provider_quota", conversationContinuation: "continue_conversation_v1" },
+    });
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(result.enqueued).toBe(1);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({ reason: "issue_monitor_due" });
+    expect(wakeups[0]!.runId).not.toBeNull();
+    expect(wakeups[0]!.runId).not.toBe(sourceRunId);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_triggered");
+  });
+
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
     const sourceRunId = randomUUID();
     const { companyId, issueId, agentId: assigneeAgentId } = await seedFixture({

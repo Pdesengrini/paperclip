@@ -558,6 +558,12 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+// The scheduler tick owns a due quota monitor; recovery only replaces one the
+// tick has visibly failed to dispatch.
+const PROVIDER_QUOTA_MONITOR_DISPATCH_GRACE_MS = 10 * 60 * 1000;
+// How long in-place quota monitors may keep waiting on one failed run before
+// recovery hands the wait to its durable scheduled-retry path.
+export const PROVIDER_QUOTA_MONITOR_MAX_SOURCE_WAIT_MS = 24 * 60 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -4339,7 +4345,13 @@ export function recoveryService(
 
     const classificationMetadata = withAdapterFailureRecoveryClassification(
       { ...latestRun, resultJson: {} }, classification,
-    ).resultJson;
+    ).resultJson as Record<string, unknown>;
+    // Re-arms on the same run keep the first wait start; it bounds the wait.
+    const recoveryStartedAt = readNonEmptyString(
+      parseObject(classifiedRun.resultJson).providerQuotaRecoveryStartedAt,
+    );
+    if (classification.kind === "provider_quota" && recoveryStartedAt)
+      classificationMetadata.providerQuotaRecoveryStartedAt = recoveryStartedAt;
     const [updated] = await db
       .update(heartbeatRuns)
       .set({
@@ -4367,6 +4379,9 @@ export function recoveryService(
             retryNotBefore: classification.retryAt.toISOString(),
             transientRetryNotBefore: classification.retryAt.toISOString(),
             providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+            providerQuotaRecoveryStartedAt:
+              readNonEmptyString(resultJson.providerQuotaRecoveryStartedAt) ??
+              new Date().toISOString(),
           }
         : { errorFamily: "configuration_incomplete" };
     const errorCode = classification.kind;
@@ -4480,6 +4495,22 @@ export function recoveryService(
     return participant?.type === "agent" ? participant.agentId : null;
   }
 
+  function hasExceededProviderQuotaMonitorWait(
+    latestRun: NonNullable<LatestIssueRun>,
+    now: Date,
+  ) {
+    const startedAt = readNonEmptyString(
+      parseObject(latestRun.resultJson).providerQuotaRecoveryStartedAt,
+    );
+    const started = startedAt ? new Date(startedAt) : null;
+    return Boolean(
+      started &&
+        !Number.isNaN(started.getTime()) &&
+        now.getTime() - started.getTime() >=
+          PROVIDER_QUOTA_MONITOR_MAX_SOURCE_WAIT_MS,
+    );
+  }
+
   function hasPendingProviderQuotaRecoveryMonitor(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
@@ -4488,7 +4519,8 @@ export function recoveryService(
     if (
       !latestRun ||
       !issue.monitorNextCheckAt ||
-      issue.monitorNextCheckAt.getTime() <= now.getTime()
+      issue.monitorNextCheckAt.getTime() <=
+        now.getTime() - PROVIDER_QUOTA_MONITOR_DISPATCH_GRACE_MS
     )
       return false;
     const monitor = parseObject(parseObject(issue.executionPolicy).monitor);
@@ -4942,6 +4974,23 @@ export function recoveryService(
         }
 
         if (adapterFailureClassification.kind === "provider_quota") {
+          if (hasExceededProviderQuotaMonitorWait(latestRun, recoveryNow)) {
+            // Monitors keep firing without replacing this run. Stop re-arming
+            // them and let the quota recovery action own a real retry run.
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: issue.status as StrandedPreviousStatus,
+              latestRun,
+              recoveryCause: "provider_quota",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
           const monitored = await scheduleProviderQuotaRecoveryMonitor({
             issue,
             latestRun,
@@ -5166,6 +5215,26 @@ export function recoveryService(
         if (
           participantAdapterFailureClassification?.kind === "provider_quota"
         ) {
+          if (
+            hasExceededProviderQuotaMonitorWait(participantLatestRun, recoveryNow)
+          ) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              comment:
+                "The active review participant's provider-quota wait did not produce a new run. " +
+                "Moving the issue to `blocked` instead of re-arming the quota monitor again.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
           const monitored = await scheduleProviderQuotaRecoveryMonitor({
             issue,
             latestRun: participantLatestRun,

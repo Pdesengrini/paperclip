@@ -1166,9 +1166,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
     expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
 
-    // A periodic sweep can land a moment after the monitor comes due, before
-    // the scheduler tick dispatches it. Re-arming here would push the check
-    // back again on every sweep.
     const dueAt = new Date(Date.now() - 1_000);
     await db.update(issues).set({ monitorNextCheckAt: dueAt }).where(eq(issues.id, sourceIssueId));
     expect(await recovery.reconcileStrandedAssignedIssues())
@@ -1176,7 +1173,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [afterDueSweep] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(afterDueSweep?.monitorNextCheckAt?.toISOString()).toBe(dueAt.toISOString());
 
-    // A monitor the scheduler has visibly failed to dispatch is still replaced.
     await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() - 60 * 60_000) })
       .where(eq(issues.id, sourceIssueId));
     expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });

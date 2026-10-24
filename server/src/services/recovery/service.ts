@@ -546,8 +546,6 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
-// The scheduler tick owns a due quota monitor; recovery only replaces one the
-// tick has visibly failed to dispatch.
 const PROVIDER_QUOTA_MONITOR_DISPATCH_GRACE_MS = 10 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =

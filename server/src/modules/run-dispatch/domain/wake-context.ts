@@ -16,6 +16,7 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
+export const PENDING_INTERACTION_WAKE_REASON = "interaction_pending";
 export const WORKSPACE_BUSY_RETRY_REASON = "workspace_busy";
 export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
@@ -107,6 +108,24 @@ export function allowsIssueInteractionWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (!wakeReason || !allowedWakeReasons.has(wakeReason)) return false;
   return Boolean(deriveCommentId(contextSnapshot));
+}
+
+/**
+ * Reads the interaction id from a pending-card wake snapshot. This is only an
+ * identifier: the caller must still verify in the database that the
+ * interaction is pending and addressed to the run's agent before treating it
+ * as authority to run outside assignee-ship.
+ */
+export function readPendingInteractionWakeId(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): string | null {
+  if (
+    readNonEmptyString(contextSnapshot?.wakeReason) !==
+    PENDING_INTERACTION_WAKE_REASON
+  ) {
+    return null;
+  }
+  return readNonEmptyString(contextSnapshot?.interactionId);
 }
 
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {

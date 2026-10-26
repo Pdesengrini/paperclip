@@ -98,9 +98,12 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
       .map(identity => identity.rootKey)])];
     const retained: Array<typeof executionWorkspaceRepositoryAccess.$inferSelect> = [];
     for (let offset = 0; offset < rootKeys.length; offset += 500) {
-      retained.push(...await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
+      // Spreading the batch into push() overflows the call stack once it holds >~120k rows.
+      for (const row of await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
         eq(executionWorkspaceRepositoryAccess.companyId, input.companyId),
-        inArray(executionWorkspaceRepositoryAccess.rootKey, rootKeys.slice(offset, offset + 500)))));
+        inArray(executionWorkspaceRepositoryAccess.rootKey, rootKeys.slice(offset, offset + 500))))) {
+        retained.push(row);
+      }
     }
     return retained;
   });

@@ -204,7 +204,8 @@ async function seedWorkspaceTrustForRun(ctx: AdapterExecutionContext): Promise<v
   });
   if (adapterExecutionTargetIsRemote(executionTarget)) return;
 
-  const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
+  // A context-less ctx must fall through to the engine's own error, not throw here.
+  const workspaceContext = parseObject(ctx.context?.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceSource = asString(workspaceContext.source, "");

@@ -86,6 +86,24 @@ describe("wake context", () => {
     expect(readPendingInteractionWakeId(null)).toBeNull();
   });
 
+  it("keeps the pending-card identity across a bounded retry", () => {
+    expect(readPendingInteractionWakeId({
+      wakeReason: "transient_failure_retry",
+      retryReason: "transient_failure",
+      originalWakeReason: "interaction_pending",
+      interactionId: "interaction-1",
+    })).toBe("interaction-1");
+    expect(readPendingInteractionWakeId({
+      wakeReason: "transient_failure_retry",
+      originalWakeReason: "issue_commented",
+      interactionId: "interaction-1",
+    })).toBeNull();
+    expect(readPendingInteractionWakeId({
+      wakeReason: "transient_failure_retry",
+      originalWakeReason: "interaction_pending",
+    })).toBeNull();
+  });
+
   it.each(["accepted", "answered", "cancelled", "rejected"])(
     "recognizes %s issue-comment interaction continuations",
     (interactionStatus) => {

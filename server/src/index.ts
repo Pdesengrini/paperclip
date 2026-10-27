@@ -31,6 +31,7 @@ import { registerTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./se
 import { isIdleTaskDrainActive, beginIdleTrackedWork, trackIdleWork } from "./services/task-admission.js";
 import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/idle-local-work.js";
 import { clearIdleBackupWakeRequired, idleBackupWakeMarker, markIdleBackupWakeRequired, verifyIdleDatabaseBackup } from "./services/idle-database-backup.js";
+import { computeFirstScheduledBackupDelayMs, findLatestServerBackup } from "./services/database-backup-schedule.js";
 import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.js";
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
@@ -2018,12 +2019,39 @@ async function startServerWithDatabaseTeardown(
     if (!isWarmStandby() && existsSync(idleBackupWakeMarker(config.databaseBackupDir))) {
       await runServerDatabaseBackup("scheduled").catch(() => {});
     }
-    setInterval(() => {
+    const runScheduledDatabaseBackup = () => {
       if (isWarmStandby() || isIdleTaskDrainActive()) return;
       void runServerDatabaseBackup("scheduled").catch(() => {
         // runServerDatabaseBackup already logs the failure with context.
       });
-    }, backupIntervalMs);
+    };
+    // Anchor the schedule to the last dump, not to process start: restarts
+    // closer together than the interval would otherwise starve backups.
+    let latestBackup: ReturnType<typeof findLatestServerBackup> = null;
+    try {
+      latestBackup = findLatestServerBackup(config.databaseBackupDir, "paperclip");
+    } catch (err) {
+      logger.warn({ err, backupDir: config.databaseBackupDir }, "Could not read latest database backup; scheduling from startup");
+    }
+    const nowMs = Date.now();
+    const firstBackupDelayMs = computeFirstScheduledBackupDelayMs({
+      latestBackupMtimeMs: latestBackup?.mtimeMs ?? null,
+      nowMs,
+      intervalMs: backupIntervalMs,
+    });
+    logger.info(
+      {
+        latestBackup: latestBackup?.name ?? null,
+        latestBackupAt: latestBackup ? new Date(latestBackup.mtimeMs).toISOString() : null,
+        firstRunAt: new Date(nowMs + firstBackupDelayMs).toISOString(),
+        firstRunDelayMinutes: Math.round(firstBackupDelayMs / 60_000),
+      },
+      "Automatic database backup first run scheduled",
+    );
+    setTimeout(() => {
+      runScheduledDatabaseBackup();
+      setInterval(runScheduledDatabaseBackup, backupIntervalMs);
+    }, firstBackupDelayMs);
   }
   
   // Wait for external adapters to finish loading before accepting requests.

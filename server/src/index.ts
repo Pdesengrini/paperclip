@@ -2026,32 +2026,36 @@ async function startServerWithDatabaseTeardown(
       });
     };
     // Anchor the schedule to the last dump, not to process start: restarts
-    // closer together than the interval would otherwise starve backups.
-    let latestBackup: ReturnType<typeof findLatestServerBackup> = null;
-    try {
-      latestBackup = findLatestServerBackup(config.databaseBackupDir, "paperclip");
-    } catch (err) {
-      logger.warn({ err, backupDir: config.databaseBackupDir }, "Could not read latest database backup; scheduling from startup");
-    }
-    const nowMs = Date.now();
-    const firstBackupDelayMs = computeFirstScheduledBackupDelayMs({
-      latestBackupMtimeMs: latestBackup?.mtimeMs ?? null,
-      nowMs,
-      intervalMs: backupIntervalMs,
-    });
-    logger.info(
-      {
-        latestBackup: latestBackup?.name ?? null,
-        latestBackupAt: latestBackup ? new Date(latestBackup.mtimeMs).toISOString() : null,
-        firstRunAt: new Date(nowMs + firstBackupDelayMs).toISOString(),
-        firstRunDelayMinutes: Math.round(firstBackupDelayMs / 60_000),
-      },
-      "Automatic database backup first run scheduled",
-    );
-    setTimeout(() => {
-      runScheduledDatabaseBackup();
-      setInterval(runScheduledDatabaseBackup, backupIntervalMs);
-    }, firstBackupDelayMs);
+    // closer together than the interval would otherwise starve backups. The
+    // directory scan runs off the startup path so slow storage cannot hold it.
+    const scheduleFirstDatabaseBackup = async () => {
+      let latestBackup: Awaited<ReturnType<typeof findLatestServerBackup>> = null;
+      try {
+        latestBackup = await findLatestServerBackup(config.databaseBackupDir, "paperclip");
+      } catch (err) {
+        logger.warn({ err, backupDir: config.databaseBackupDir }, "Could not read latest database backup; scheduling from startup");
+      }
+      const nowMs = Date.now();
+      const firstBackupDelayMs = computeFirstScheduledBackupDelayMs({
+        latestBackupMtimeMs: latestBackup?.mtimeMs ?? null,
+        nowMs,
+        intervalMs: backupIntervalMs,
+      });
+      logger.info(
+        {
+          latestBackup: latestBackup?.name ?? null,
+          latestBackupAt: latestBackup ? new Date(latestBackup.mtimeMs).toISOString() : null,
+          firstRunAt: new Date(nowMs + firstBackupDelayMs).toISOString(),
+          firstRunDelayMinutes: Math.round(firstBackupDelayMs / 60_000),
+        },
+        "Automatic database backup first run scheduled",
+      );
+      setTimeout(() => {
+        runScheduledDatabaseBackup();
+        setInterval(runScheduledDatabaseBackup, backupIntervalMs);
+      }, firstBackupDelayMs);
+    };
+    void scheduleFirstDatabaseBackup();
   }
   
   // Wait for external adapters to finish loading before accepting requests.

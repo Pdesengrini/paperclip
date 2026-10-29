@@ -23,8 +23,14 @@ async function writeBackup(name: string, mtimeMs: number) {
 
 describe("findLatestServerBackup", () => {
   it("returns null for a missing or empty directory", async () => {
-    expect(findLatestServerBackup(path.join(directory, "missing"))).toBeNull();
-    expect(findLatestServerBackup(directory)).toBeNull();
+    expect(await findLatestServerBackup(path.join(directory, "missing"))).toBeNull();
+    expect(await findLatestServerBackup(directory)).toBeNull();
+  });
+
+  it("rejects when the backup directory cannot be read", async () => {
+    const notADirectory = path.join(directory, "file");
+    await writeFile(notADirectory, "x");
+    await expect(findLatestServerBackup(notADirectory)).rejects.toMatchObject({ code: "ENOTDIR" });
   });
 
   it("picks the newest server-named dump and ignores hand-named, partial and foreign files", async () => {
@@ -37,7 +43,7 @@ describe("findLatestServerBackup", () => {
     await writeBackup("other-20261026-010000.sql.gz", base + 13 * HOUR);
     await mkdir(path.join(directory, "paperclip-20261027-010000.sql.gz"));
 
-    expect(findLatestServerBackup(directory)).toEqual({
+    expect(await findLatestServerBackup(directory)).toEqual({
       name: "paperclip-20261025-104252.sql.gz",
       mtimeMs: base,
     });
@@ -47,14 +53,14 @@ describe("findLatestServerBackup", () => {
     const base = Date.UTC(2026, 9, 25, 12);
     await writeBackup("paperclip-20261025-104252.sql.gz", base);
     await writeBackup("paperclip-20261025-130000-3f2a9c1e-1b2c-4d5e-8f90-123456789abc.sql.gz", base + HOUR);
-    expect(findLatestServerBackup(directory)?.mtimeMs).toBe(base + HOUR);
+    expect((await findLatestServerBackup(directory))?.mtimeMs).toBe(base + HOUR);
   });
 
   it("honours a custom prefix", async () => {
     const base = Date.UTC(2026, 9, 25, 12);
     await writeBackup("paperclip-20261025-104252.sql.gz", base + HOUR);
     await writeBackup("acme.co-20261025-104252.sql.gz", base);
-    expect(findLatestServerBackup(directory, "acme.co")?.name).toBe("acme.co-20261025-104252.sql.gz");
+    expect((await findLatestServerBackup(directory, "acme.co"))?.name).toBe("acme.co-20261025-104252.sql.gz");
   });
 });
 

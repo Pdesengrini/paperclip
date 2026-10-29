@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 // Node clamps setTimeout delays above this to 1ms.
@@ -19,22 +19,30 @@ function escapeRegExp(value: string): string {
  * Newest completed dump written by the server's own backup runner
  * (`<prefix>-YYYYMMDD-HHMMSS[-<checkpoint-id>].sql.gz`). Hand-named dumps
  * (e.g. `<prefix>-pre-deploy-...`) and in-progress `.sql` files are ignored.
+ * Reads are asynchronous so slow backup storage cannot stall the event loop;
+ * a missing directory resolves to null and any other read error rejects.
  */
-export function findLatestServerBackup(
+export async function findLatestServerBackup(
   backupDir: string,
   filenamePrefix = "paperclip",
-): LatestServerBackup | null {
-  if (!existsSync(backupDir)) return null;
+): Promise<LatestServerBackup | null> {
   const pattern = new RegExp(
     `^${escapeRegExp(filenamePrefix)}-\\d{8}-\\d{6}(?:-[0-9a-f-]+)?\\.sql\\.gz$`,
   );
+  let names: string[];
+  try {
+    names = await readdir(backupDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
   let latest: LatestServerBackup | null = null;
-  for (const name of readdirSync(backupDir)) {
+  for (const name of names) {
     if (!pattern.test(name)) continue;
-    const stat = statSync(join(backupDir, name));
-    if (!stat.isFile()) continue;
-    if (!latest || stat.mtimeMs > latest.mtimeMs) {
-      latest = { name, mtimeMs: stat.mtimeMs };
+    const info = await stat(join(backupDir, name));
+    if (!info.isFile()) continue;
+    if (!latest || info.mtimeMs > latest.mtimeMs) {
+      latest = { name, mtimeMs: info.mtimeMs };
     }
   }
   return latest;

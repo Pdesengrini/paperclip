@@ -564,9 +564,11 @@ describe("startServer feedback export wiring", () => {
       const options = createAppMock.mock.calls[0]?.[1] as unknown as { prepareIdleDatabaseBackup?: unknown };
       expect(Boolean(options.prepareIdleDatabaseBackup)).toBe(checkpointMode);
       expect(existsSync(idleBackupWakeMarker(directory))).toBe(fails);
+      // The first run is scheduled after an asynchronous directory scan. Wait
+      // for it in every case so it cannot land in the next test's timer spy.
+      await vi.waitFor(() => expect(retry).toEqual(expect.any(Function)));
       if (fails) {
         vi.mocked(runDatabaseBackup).mockImplementationOnce(writeBackup);
-        expect(retry).toEqual(expect.any(Function));
         const activeBeforeRetry = idleWorkSnapshot().active;
         const intervalsBeforeRetry = timers.mock.calls.length;
         retry!();
